@@ -3,7 +3,7 @@ import numpy as np
 import os
 
 libpath = os.path.dirname(os.path.abspath(__file__))
-Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.so'))
+Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.dll'))
 
 
 def SetMesh(V, F):
