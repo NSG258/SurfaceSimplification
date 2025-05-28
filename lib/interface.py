@@ -11,6 +11,31 @@ def SetMesh(V, F):
   handle = Processor.SetMesh(c_void_p(V.ctypes.data), c_void_p(F.ctypes.data), V.shape[0], F.shape[0]);
   return handle
 
+def Simplify():
+  '''
+    一步到位，直接获取简化结果
+  '''
+  Processor.Simplify()
+  vertices, faces = GetMesh()
+  return vertices, faces
+  
+def SimplifyStep():
+  '''
+    SimplifyStep(): 每次调用的时候，只收缩一次
+    GetActiveVertices(): 返回收缩的那两个顶点
+  '''
+  Processor.SimplifyStep()
+  
+  vertices, faces = GetMesh()
+  
+  Processor.GetActiveVertices.restype = POINTER(c_int)
+  Processor.GetActiveVertices.argtypes = [POINTER(c_int)]
+  num_active_v = c_int()
+  ptr_active_v = Processor.GetActiveVertices(byref(num_active_v))
+  arr_active_v = np.ctypeslib.as_array(ptr_active_v, shape=(num_active_v,)).reshape((num_active_v.value,))
+
+  return vertices, faces, arr_active_v
+
 def GetMesh():
   Processor.GetMeshVertices.restype = POINTER(c_float)
   Processor.GetMeshVertices.argtypes = [POINTER(c_int)]

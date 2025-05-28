@@ -1,5 +1,5 @@
 import sys
-from PyQt5 import QtWidgets
+from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtGui import QFont
 import vtk
 import os
@@ -36,6 +36,7 @@ class VTKWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        self.test_id = 0
         self.mesh1_path = None
         self.mesh2_path = None  # 右侧原始mesh路径
 
@@ -94,6 +95,7 @@ class VTKWindow(QtWidgets.QMainWindow):
         # 第三行：状态标签
         left_layout.addWidget(self.origin_label)
         left_layout.addWidget(self.simplified_label)
+        left_layout.addWidget(self.reset_camera_btn)
         # 添加 stretch 拉伸填充，避免控件顶到底部
         left_layout.addStretch()
         # 右侧：VTK 渲染窗口
@@ -136,6 +138,10 @@ class VTKWindow(QtWidgets.QMainWindow):
 
     def on_load_left_clicked(self):
         uid = self.uid_input.text().strip()
+        
+        # 清空右侧视图
+        self.renderer_left.RemoveAllViewProps()
+        self.renderer_right.RemoveAllViewProps()
         if not uid:
             self.origin_label.setText("请输入有效的 Object UID")
             return
@@ -153,8 +159,7 @@ class VTKWindow(QtWidgets.QMainWindow):
         self.origin_label.setText(f"原始网格，顶点数: {len(V)}, 面数: {len(F)}")
         self.load_left_mesh(self.mesh1_path)
 
-        # 清空右侧视图
-        self.renderer_right.RemoveAllViewProps()
+
         self.renderWindow.Render()
 
         self.load_right_btn.setEnabled(True)
@@ -226,7 +231,6 @@ class VTKWindow(QtWidgets.QMainWindow):
         # 转换简化结果到vtkPolyData
         polydata = self.numpy_to_vtk_polydata(V_simplified, F_simplified)
         
-        set_face_colors(polydata, [0, 1, 2, 3, 4], (255, 0, 0))
 
         mapper2 = vtk.vtkPolyDataMapper()
         mapper2.SetInputData(polydata)
@@ -246,10 +250,83 @@ class VTKWindow(QtWidgets.QMainWindow):
         # 恢复按钮
         self.load_right_btn.setEnabled(True)
 
-    def reset_camera(self):
-        self.renderer_left.ResetCamera()
+    def animate_camera_to(self, target_position, target_focal_point, duration=1.0, steps=60, on_finish=None):
+        camera = self.renderer_left.GetActiveCamera()
+        self._anim_camera = camera  # 缓存，供 update 调用
+
+        self._anim_on_finish = on_finish  # 保存回调
+
+        # 起始位置
+        start_pos = np.array(camera.GetPosition())
+        start_fp = np.array(camera.GetFocalPoint())
+
+        self.camera_interp_step = 0
+        self.camera_interp_steps = steps
+        self.camera_pos_delta = (np.array(target_position) - start_pos) / steps
+        self.camera_fp_delta = (np.array(target_focal_point) - start_fp) / steps
+        self.camera_start_pos = start_pos
+        self.camera_start_fp = start_fp
+
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_camera_interpolation)
+        self.timer.start(int(duration * 1000 / steps))
+        
+    def update_camera_interpolation(self):
+        step = self.camera_interp_step
+        camera = self._anim_camera
+
+        if step >= self.camera_interp_steps:
+            self.timer.stop()
+            if self._anim_on_finish:
+                self._anim_on_finish()  # 动画结束回调
+            return
+
+        new_pos = self.camera_start_pos + step * self.camera_pos_delta
+        new_fp = self.camera_start_fp + step * self.camera_fp_delta
+
+        camera.SetPosition(*new_pos)
+        camera.SetFocalPoint(*new_fp)
         self.renderWindow.Render()
 
+        self.camera_interp_step += 1
+
+    def reset_camera(self):
+        # 获取右侧的 renderer（也可以选择左侧）
+        renderer = self.renderer_right if self.renderer_right.GetActors().GetNumberOfItems() > 0 else self.renderer_left
+        camera = renderer.GetActiveCamera()
+        actors = renderer.GetActors()
+        actors.InitTraversal()
+        actor = actors.GetNextActor()
+        if not actor:
+            return
+        polydata = actor.GetMapper().GetInput()
+        if not polydata:
+            return
+        face_id = self.test_id
+        
+        cell = polydata.GetCell(face_id)
+        p0 = np.array(polydata.GetPoint(cell.GetPointId(0)))
+        p1 = np.array(polydata.GetPoint(cell.GetPointId(1)))
+        p2 = np.array(polydata.GetPoint(cell.GetPointId(2)))
+        face_center = (p0 + p1 + p2) / 3
+
+        # 获取法向量（用于相机方向）
+        normal = np.cross(p1 - p0, p2 - p0)
+        normal = normal / np.linalg.norm(normal)
+
+        # 设置相机的位置：在法线方向上方离面中心一定距离
+        distance = 1.5 * np.linalg.norm(polydata.GetLength())  # 可调
+        camera_position = face_center + normal * distance
+        set_face_colors(polydata, [self.test_id], (255, 128, 128))
+        self.test_id += 1
+
+        # 设置相机参数
+        def on_camera_done():
+            camera.SetViewUp(0, 1, 0)
+            renderer.ResetCameraClippingRange()
+            self.renderWindow.Render()
+
+        self.animate_camera_to(camera_position, face_center, on_finish=on_camera_done)
 
 if __name__ == "__main__":
 
