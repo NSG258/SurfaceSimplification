@@ -3,7 +3,7 @@ import numpy as np
 import os
 
 libpath = os.path.dirname(os.path.abspath(__file__))
-Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.dll'))
+Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.so'))
 
 
 def SetMesh(V, F):
@@ -11,11 +11,12 @@ def SetMesh(V, F):
   handle = Processor.SetMesh(c_void_p(V.ctypes.data), c_void_p(F.ctypes.data), V.shape[0], F.shape[0]);
   return handle
 
-def Simplify():
+def Simplify(targetRatio=0.5):
   '''
     一步到位，直接获取简化结果
   '''
-  Processor.Simplify()
+  Processor.Simplify.argtypes = [c_float]
+  Processor.Simplify(targetRatio)
   vertices, faces = GetMesh()
   return vertices, faces
   
@@ -29,10 +30,10 @@ def SimplifyStep():
   vertices, faces = GetMesh()
   
   Processor.GetActiveVertices.restype = POINTER(c_int)
-  Processor.GetActiveVertices.argtypes = [POINTER(c_int)]
-  num_active_v = c_int()
-  ptr_active_v = Processor.GetActiveVertices(byref(num_active_v))
-  arr_active_v = np.ctypeslib.as_array(ptr_active_v, shape=(num_active_v,)).reshape((num_active_v.value,))
+  # Processor.GetActiveVertices.argtypes = [POINTER(c_int)]
+  # num_active_v = c_int()
+  ptr_active_v = Processor.GetActiveVertices()
+  arr_active_v = np.ctypeslib.as_array(ptr_active_v, shape=(2,))
 
   return vertices, faces, arr_active_v
 

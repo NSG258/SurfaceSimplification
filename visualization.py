@@ -214,6 +214,7 @@ class VTKWindow(QtWidgets.QMainWindow):
 
         # 执行简化
         SetMesh(V, F)
+        SimplifyStep()
         V_simplified, F_simplified = GetMesh()
         mesh_simplified = trimesh.Trimesh(vertices=V_simplified, faces=F_simplified)
     
