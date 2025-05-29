@@ -3,7 +3,9 @@ import numpy as np
 import os
 
 libpath = os.path.dirname(os.path.abspath(__file__))
-Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.so'))
+Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.dll'))
+# Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.so'))
+
 
 
 def SetMesh(V, F):
@@ -33,7 +35,7 @@ def SimplifyStep():
   # Processor.GetActiveVertices.argtypes = [POINTER(c_int)]
   # num_active_v = c_int()
   ptr_active_v = Processor.GetActiveVertices()
-  arr_active_v = np.ctypeslib.as_array(ptr_active_v, shape=(2,))
+  arr_active_v = np.ctypeslib.as_array(ptr_active_v, shape=(3,))
 
   return vertices, faces, arr_active_v
 

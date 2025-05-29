@@ -8,6 +8,16 @@ import trimesh
 import numpy as np
 from lib.interface import *
 
+def get_active_faces(faces, uids):
+    has_v1 = np.any(faces == uids[0], axis=1)
+    has_v2 = np.any(faces == uids[1], axis=1)
+    
+    both = np.where(np.logical_and(has_v1, has_v2))[0]
+    only_v1 = np.where(np.logical_and(has_v1, ~has_v2))[0]
+    only_v2 = np.where(np.logical_and(~has_v1, has_v2))[0]
+
+    return both, only_v1, only_v2
+
 def set_face_colors(polydata, face_indices, color):
     """
     polydata: vtkPolyData对象
@@ -37,8 +47,11 @@ class VTKWindow(QtWidgets.QMainWindow):
         super().__init__(parent)
 
         self.test_id = 0
-        self.mesh1_path = None
-        self.mesh2_path = None  # 右侧原始mesh路径
+        self.origin_mesh_path = None
+        self.simplified_mesh_path = None  # 右侧原始mesh路径
+        self.display_mode = "result"
+        self.current_v = None
+        self.current_f = None
 
         self.frame = QtWidgets.QFrame()
         self.layout = QtWidgets.QVBoxLayout()
@@ -54,7 +67,7 @@ class VTKWindow(QtWidgets.QMainWindow):
 
         # 按钮
         self.load_left_btn = QtWidgets.QPushButton("加载网格")
-        self.load_left_btn.clicked.connect(self.on_load_left_clicked)
+        self.load_left_btn.clicked.connect(self.load_left_mesh)
         self.load_right_btn = QtWidgets.QPushButton("执行简化")
         self.load_right_btn.setEnabled(False)
         self.load_right_btn.clicked.connect(self.load_right_mesh)
@@ -64,8 +77,17 @@ class VTKWindow(QtWidgets.QMainWindow):
         self.load_right_btn.setFixedHeight(80)
         self.load_right_btn.setStyleSheet("background-color: lightblue; font-weight: bold;")
 
-        self.reset_camera_btn = QtWidgets.QPushButton("重置相机")
-        self.reset_camera_btn.clicked.connect(self.reset_camera)
+        self.simplfy_step_btn = QtWidgets.QPushButton("查看单步简化")
+        self.simplfy_step_btn.clicked.connect(self.simplfy_step)
+        self.simplfy_step_btn.setEnabled(True)
+        self.reset_camera_btn = QtWidgets.QPushButton("单步简化")
+        self.reset_camera_btn.clicked.connect(self.simplify_single_step)
+        self.reset_camera_btn.setEnabled(False)
+        
+        self.simplfy_step_btn.setFixedHeight(80)
+        self.simplfy_step_btn.setStyleSheet("background-color: orange; font-weight: bold;")
+        self.reset_camera_btn.setFixedHeight(80)
+        self.reset_camera_btn.setStyleSheet("background-color: yellow; font-weight: bold;")
 
         
         # 状态显示标签
@@ -88,14 +110,18 @@ class VTKWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(self.uid_label)
         left_layout.addWidget(self.uid_input)
         # 第二行：加载按钮 + 简化按钮（水平排列）
-        button_row = QtWidgets.QHBoxLayout()
-        button_row.addWidget(self.load_left_btn)
-        button_row.addWidget(self.load_right_btn)
-        left_layout.addLayout(button_row)
+        button_row1 = QtWidgets.QHBoxLayout()
+        button_row1.addWidget(self.load_left_btn)
+        button_row1.addWidget(self.load_right_btn)
+        left_layout.addLayout(button_row1)
         # 第三行：状态标签
         left_layout.addWidget(self.origin_label)
         left_layout.addWidget(self.simplified_label)
-        left_layout.addWidget(self.reset_camera_btn)
+        
+        button_row2 = QtWidgets.QHBoxLayout()
+        button_row2.addWidget(self.simplfy_step_btn)
+        button_row2.addWidget(self.reset_camera_btn)
+        left_layout.addLayout(button_row2)
         # 添加 stretch 拉伸填充，避免控件顶到底部
         left_layout.addStretch()
         # 右侧：VTK 渲染窗口
@@ -136,55 +162,6 @@ class VTKWindow(QtWidgets.QMainWindow):
         self.vtkWidget.Start()
         self.show()
 
-    def on_load_left_clicked(self):
-        uid = self.uid_input.text().strip()
-        
-        # 清空右侧视图
-        self.renderer_left.RemoveAllViewProps()
-        self.renderer_right.RemoveAllViewProps()
-        if not uid:
-            self.origin_label.setText("请输入有效的 Object UID")
-            return
-
-        self.mesh1_path = os.path.join("objs", uid + ".obj")
-        self.mesh2_path = os.path.join("results", uid + ".obj")
-
-        if not os.path.exists(self.mesh1_path):
-            self.origin_label.setText(f"找不到文件: {self.mesh1_path}")
-            return
-
-        mesh = trimesh.load(self.mesh1_path, process=False)
-        V = mesh.vertices.astype(np.float32)
-        F = mesh.faces.astype(np.int32)
-        self.origin_label.setText(f"原始网格，顶点数: {len(V)}, 面数: {len(F)}")
-        self.load_left_mesh(self.mesh1_path)
-
-
-        self.renderWindow.Render()
-
-        self.load_right_btn.setEnabled(True)
-
-    def load_left_mesh(self, mesh_path):
-        self.renderer_left.RemoveAllViewProps()
-
-        reader = vtk.vtkOBJReader()
-        reader.SetFileName(mesh_path)
-        reader.Update()
-
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(reader.GetOutputPort())
-
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(0.8, 0.9, 0.8)
-        actor.GetProperty().EdgeVisibilityOn()
-        actor.GetProperty().SetEdgeColor(0.1, 0.1, 0.1)
-        actor.GetProperty().SetLineWidth(1.0)
-
-        self.renderer_left.AddActor(actor)
-        self.renderer_left.ResetCamera()
-        self.renderWindow.Render()
-
     def numpy_to_vtk_polydata(self, vertices, faces):
         # 转换numpy数组到vtkPolyData
         points = vtk.vtkPoints()
@@ -199,28 +176,103 @@ class VTKWindow(QtWidgets.QMainWindow):
         polydata.SetPoints(points)
         polydata.SetPolys(polys)
         return polydata
+    
+    def load_left_mesh(self):
+        uid = self.uid_input.text().strip()
+        # 清空右侧视图
+        self.renderer_left.RemoveAllViewProps()
+        self.renderer_right.RemoveAllViewProps()
+        if not uid:
+            self.origin_label.setText("请输入有效的 Object UID")
+            return
+        self.load_right_btn.setEnabled(False)
+        self.reset_camera_btn.setEnabled(False)
+        self.origin_mesh_path = os.path.join("objs", uid + ".obj")
+        self.simplified_mesh_path = os.path.join("results", uid + ".obj")
+        self.display_mode = "result"
+        if not os.path.exists(self.origin_mesh_path):
+            self.origin_label.setText(f"找不到文件: {self.origin_mesh_path}")
+            return
+
+        mesh = trimesh.load(self.origin_mesh_path, process=False)
+        V = mesh.vertices.astype(np.float32)
+        self.current_v = V
+        F = mesh.faces.astype(np.int32)
+        self.current_f = F
+        self.origin_label.setText(f"原始网格，顶点数: {len(V)}, 面数: {len(F)}")
+        
+        # 清空右侧renderer所有actor
+        self.renderer_left.RemoveAllViewProps()
+
+        # 转换简化结果到vtkPolyData
+        polydata = self.numpy_to_vtk_polydata(self.current_v, self.current_f)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.8, 0.9, 0.8)
+        actor.GetProperty().EdgeVisibilityOn()
+        actor.GetProperty().SetEdgeColor(0.1, 0.1, 0.1)
+        actor.GetProperty().SetLineWidth(1.0)
+
+        self.renderer_left.AddActor(actor)
+        self.renderer_left.ResetCamera()
+        self.renderWindow.Render()
+        self.load_right_btn.setEnabled(True)
+        self.reset_camera_btn.setEnabled(True)
+        
+    def render_mesh(self, renderer, vertices, faces, base_color, face_colors=None):
+        renderer.RemoveAllViewProps()
+
+        polydata = self.numpy_to_vtk_polydata(vertices, faces)
+
+        if face_colors is not None:
+            # 设置颜色（assume face_colors: dict{face_id: (r, g, b)})
+            colors = vtk.vtkUnsignedCharArray()
+            colors.SetNumberOfComponents(3)
+            colors.SetName("Colors")
+
+            for i in range(len(faces)):
+                if i in face_colors:
+                    colors.InsertNextTypedTuple(face_colors[i])
+                else:
+                    base_color_int = tuple(int(x * 255) for x in base_color)
+                    colors.InsertNextTypedTuple(base_color_int)  # 默认灰色
+            polydata.GetCellData().SetScalars(colors)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+
+        actor.GetProperty().SetColor(*base_color)
+        actor.GetProperty().EdgeVisibilityOn()
+        actor.GetProperty().SetEdgeColor(0.1, 0.1, 0.1)
+        actor.GetProperty().SetLineWidth(1.0)
+
+        renderer.AddActor(actor)
 
     def load_right_mesh(self):
         # 禁用按钮防止重复点击
+        if not self.display_mode == "result":
+            self.simplified_label.setText("处于单步调试状态，无法一步到位...")
+            self.simplified_label.repaint()
+            return
+        
         self.load_right_btn.setEnabled(False)
-
         self.simplified_label.setText("正在执行右侧网格简化，请稍候...")
         self.simplified_label.repaint()  # 强制刷新界面显示
-
-        # 加载原始mesh
-        mesh = trimesh.load(self.mesh1_path, process=False)
-        V = mesh.vertices.astype(np.float32)
-        F = mesh.faces.astype(np.int32)
-
+        V = self.current_v
+        F = self.current_f
         # 执行简化
         SetMesh(V, F)
-        SimplifyStep()
+        Simplify()
         V_simplified, F_simplified = GetMesh()
         mesh_simplified = trimesh.Trimesh(vertices=V_simplified, faces=F_simplified)
-    
         # 保存简化后的网格
-        mesh_simplified.export(self.mesh2_path)
-
+        mesh_simplified.export(self.simplified_mesh_path)
         # 更新状态标签
         self.simplified_label.setText(f"简化完成，顶点数: {len(V_simplified)}, 面数: {len(F_simplified)}\n\
         顶点减少: {len(V) - len(V_simplified)} 面减少: {len(F) - len(F_simplified)}\n \
@@ -231,8 +283,6 @@ class VTKWindow(QtWidgets.QMainWindow):
 
         # 转换简化结果到vtkPolyData
         polydata = self.numpy_to_vtk_polydata(V_simplified, F_simplified)
-        
-
         mapper2 = vtk.vtkPolyDataMapper()
         mapper2.SetInputData(polydata)
         actor2 = vtk.vtkActor()
@@ -244,10 +294,8 @@ class VTKWindow(QtWidgets.QMainWindow):
         actor2.GetProperty().SetLineWidth(1.0)
 
         self.renderer_right.AddActor(actor2)
-
         # 渲染更新
         self.renderWindow.Render()
-
         # 恢复按钮
         self.load_right_btn.setEnabled(True)
 
@@ -281,19 +329,45 @@ class VTKWindow(QtWidgets.QMainWindow):
             if self._anim_on_finish:
                 self._anim_on_finish()  # 动画结束回调
             return
-
         new_pos = self.camera_start_pos + step * self.camera_pos_delta
         new_fp = self.camera_start_fp + step * self.camera_fp_delta
-
         camera.SetPosition(*new_pos)
         camera.SetFocalPoint(*new_fp)
         self.renderWindow.Render()
-
         self.camera_interp_step += 1
+        
+    
+    def simplify_single_step(self):
+        if not self.display_mode == "step":
+            self.simplified_label.setText("无法进行单步调试...")
+            self.simplified_label.repaint()
+            return
+        
+        new_v, new_f, active_v = SimplifyStep()
+        active_faces, only_v1, only_v2 = get_active_faces(self.current_f, active_v)
+        mask = np.any(new_f == active_v[2], axis=1)
+        only_v1_new = np.where(mask)[0]
 
-    def reset_camera(self):
+        # 为 active faces 上色：face_id -> (r,g,b)
+        color_dict_left = {}
+        color_dict_left.update({fid: (255, 128, 128) for fid in active_faces})
+        color_dict_left.update({fid: (255, 192, 128) for fid in only_v1})
+        color_dict_left.update({fid: (255, 192, 128) for fid in only_v2})
+        
+        color_dict_right = {}
+        color_dict_right.update({fid: (255, 255, 128) for fid in only_v1_new})
+
+        # 渲染左侧（当前 mesh，染色）
+        self.render_mesh(self.renderer_left, self.current_v, self.current_f, (0.8, 0.9, 0.8), face_colors=color_dict_left)
+
+        # 渲染右侧（简化后 mesh，无染色）
+        self.render_mesh(self.renderer_right, new_v, new_f, (0.8, 0.8, 0.9), face_colors=color_dict_right)
+        
+        self.current_v = new_v
+        self.current_f = new_f
+
         # 获取右侧的 renderer（也可以选择左侧）
-        renderer = self.renderer_right if self.renderer_right.GetActors().GetNumberOfItems() > 0 else self.renderer_left
+        renderer = self.renderer_left
         camera = renderer.GetActiveCamera()
         actors = renderer.GetActors()
         actors.InitTraversal()
@@ -303,23 +377,23 @@ class VTKWindow(QtWidgets.QMainWindow):
         polydata = actor.GetMapper().GetInput()
         if not polydata:
             return
-        face_id = self.test_id
+        face_id = active_faces[0]
+        # print(len(self.current_v), active_v, active_faces)
         
         cell = polydata.GetCell(face_id)
         p0 = np.array(polydata.GetPoint(cell.GetPointId(0)))
         p1 = np.array(polydata.GetPoint(cell.GetPointId(1)))
         p2 = np.array(polydata.GetPoint(cell.GetPointId(2)))
         face_center = (p0 + p1 + p2) / 3
-
         # 获取法向量（用于相机方向）
         normal = np.cross(p1 - p0, p2 - p0)
         normal = normal / np.linalg.norm(normal)
-
         # 设置相机的位置：在法线方向上方离面中心一定距离
         distance = 1.5 * np.linalg.norm(polydata.GetLength())  # 可调
         camera_position = face_center + normal * distance
-        set_face_colors(polydata, [self.test_id], (255, 128, 128))
-        self.test_id += 1
+        # set_face_colors(polydata, [self.test_id], (255, 128, 128))
+        # self.test_id += 1
+
 
         # 设置相机参数
         def on_camera_done():
@@ -328,6 +402,14 @@ class VTKWindow(QtWidgets.QMainWindow):
             self.renderWindow.Render()
 
         self.animate_camera_to(camera_position, face_center, on_finish=on_camera_done)
+        
+    def simplfy_step(self):
+        self.display_mode = "step"
+        self.load_right_btn.setEnabled(False)
+        V = self.current_v
+        F = self.current_f
+        # 执行简化
+        SetMesh(V, F)
 
 if __name__ == "__main__":
 

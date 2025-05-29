@@ -33,6 +33,7 @@ static priority_queue<Edge, vector<Edge>, greater<Edge>> edge_queue;
 static unordered_map<int64_t, Edge> edge_map; // 使用 int64_t
 static vector<unordered_set<int>> vertex_neighbors;
 static Edge best_edge;
+static unordered_map<int, int> id_map;  // <old_id, new_id>
 
 // 计算唯一边键，返回 64 位键值
 inline int64_t edge_key(int a, int b)
@@ -187,7 +188,8 @@ bool contract_edge(const Edge &e)
 
 // 清理未使用顶点
 void cleanup()
-{
+{   
+    id_map.clear();
     int nV = vertices.size();
     vector<bool> used(nV, false);
     for (auto &f : faces)
@@ -202,6 +204,7 @@ void cleanup()
         if (used[i])
         {
             remap[i] = newV.size();
+            id_map[i] = newV.size();
             newV.push_back(vertices[i]);
         }
     }
@@ -251,6 +254,9 @@ void simplifyStep()
             edge_map.erase(k);
             best_edge = e;
         }
+        // std::cout << "best_edge: " << best_edge.v1 << " - " << best_edge.v2 << ", cost = " << best_edge.cost << "\n";
+        // std::cout << "vertex[v1] = " << (vertices[best_edge.v1][0]) << (vertices[best_edge.v1][1]) << (vertices[best_edge.v1][2]) << "\n";
+        // std::cout << "vertex[v2] = " << (vertices[best_edge.v2][0]) << (vertices[best_edge.v2][1]) << (vertices[best_edge.v2][2]) << "\n";
     }
     cleanup();
 }
@@ -286,8 +292,10 @@ extern "C"
     int *GetActiveVertices()
     {
         static vector<int> buf;
+        buf.clear();
         buf.push_back(best_edge.v1);
         buf.push_back(best_edge.v2);
+        buf.push_back(id_map[best_edge.v1]);
         return buf.data();
     }
 
