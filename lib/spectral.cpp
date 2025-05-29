@@ -11,13 +11,12 @@
 #include <cstdint> // for int64_t, uint32_t
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
-// #include <glm/gtc/matrix_inverse.hpp> // Not strictly needed for this spectral version if not using QEM's matrix inversion
 
 using namespace std;
 using namespace glm;
 
-const float COT_EPSILON = 1e-6f; // Epsilon for cotangent calculations and positive weight clamping
-const int V_OPT_ITERATIONS = 5;  // Number of iterations for optimal vertex position
+const float COT_EPSILON = 1e-6f;
+const int V_OPT_ITERATIONS = 5;
 const float V_OPT_CONVERGENCE_THRESHOLD = 1e-5f;
 
 // Edge structure definition
@@ -31,12 +30,17 @@ struct Edge
 
 // Global data
 static vector<vec3> vertices;
-static vector<ivec3> faces; // Current list of faces
-// static vector<mat4> quadrics; // Removed for spectral method
+static vector<ivec3> faces;
 static priority_queue<Edge, vector<Edge>, greater<Edge>> edge_queue;
-static unordered_map<int64_t, Edge> edge_map;       // Using int64_t
-static vector<unordered_set<int>> vertex_neighbors; // Adjacency list
-static Edge best_edge;                              // For SimplifyStep
+static unordered_map<int64_t, Edge> edge_map;
+static vector<unordered_set<int>> vertex_neighbors;    // vertex_idx -> set of neighbor vertex_indices
+static vector<unordered_set<int>> vertex_face_indices; // vertex_idx -> set of incident face_indices (indices into `faces` vector)
+static Edge best_edge;
+static unordered_map<int, int> id_map; // <old_id, new_id>
+
+// Global state flags
+static bool s_mesh_structures_valid = false; // Are vertices, faces, vertex_neighbors, vertex_face_indices up-to-date?
+static bool s_priority_queue_valid = false;  // Is edge_queue and edge_map reflecting current mesh state?
 
 // Calculate unique edge key
 inline int64_t edge_key(int a, int b)
@@ -47,168 +51,139 @@ inline int64_t edge_key(int a, int b)
 }
 
 // Robust cotangent of angle <apb (angle at p)
-// v_pa = a - p, v_pb = b - p
 float cotangent_robust(const vec3 &v_pa, const vec3 &v_pb)
 {
     float dot_product = dot(v_pa, v_pb);
     float cross_product_mag = length(cross(v_pa, v_pb));
 
     if (cross_product_mag < COT_EPSILON)
-    { // Collinear or nearly collinear
-        // Check if angle is close to 0 or 180.
-        // If dot_product is positive, angle is close to 0, cot is large positive.
-        // If dot_product is negative, angle is close to 180, cot is large negative.
-        // For weights, often clamped to positive.
-        return (dot_product > 0) ? (1.0f / COT_EPSILON) : (-1.0f / COT_EPSILON); // Large magnitude
+    {
+        return (dot_product > 0) ? (1.0f / COT_EPSILON) : (-1.0f / COT_EPSILON);
     }
     return dot_product / cross_product_mag;
 }
 
-// Find vertices that form triangles with edge (v_opt_pos, P_neighbor_pos) in the new configuration
-// P_neighbor_idx is an index from the ring_indices
-// v1_orig_idx, v2_orig_idx are the vertices of the edge being collapsed
-// ring_indices contains all neighbors of v1_orig_idx or v2_orig_idx (excluding v1, v2 themselves)
-std::vector<int> find_triangle_partners_for_new_edge(
-    int P_neighbor_idx,
-    int v1_orig_idx,
-    int v2_orig_idx,
-    const std::unordered_set<int> &ring_indices)
+// Helper to get the other two vertices from a face given one vertex
+// Returns {-1, -1} if v is not in the face.
+std::pair<int, int> get_other_two_verts(const ivec3 &face, int v)
 {
-    std::vector<int> partners;
-    std::unordered_set<int> distinct_partners; // To handle cases where a partner might be found via v1 and v2
-
-    for (const auto &face : faces)
-    {
-        int face_verts[] = {face.x, face.y, face.z};
-        bool has_P_neighbor = false;
-        bool has_v1 = false;
-        bool has_v2 = false;
-        int other_v = -1;
-
-        for (int v_idx : face_verts)
-        {
-            if (v_idx == P_neighbor_idx)
-                has_P_neighbor = true;
-            else if (v_idx == v1_orig_idx)
-                has_v1 = true;
-            else if (v_idx == v2_orig_idx)
-                has_v2 = true;
-            else
-                other_v = v_idx;
-        }
-
-        if (has_P_neighbor)
-        {
-            if (has_v1 && !has_v2)
-            { // Triangle (P_neighbor, v1_orig, other_v)
-                // other_v must be in ring_indices to form new triangle (v_opt, P_neighbor, other_v)
-                if (other_v != -1 && ring_indices.count(other_v))
-                {
-                    if (distinct_partners.find(other_v) == distinct_partners.end())
-                    {
-                        partners.push_back(other_v);
-                        distinct_partners.insert(other_v);
-                    }
-                }
-            }
-            else if (has_v2 && !has_v1)
-            { // Triangle (P_neighbor, v2_orig, other_v)
-                if (other_v != -1 && ring_indices.count(other_v))
-                {
-                    if (distinct_partners.find(other_v) == distinct_partners.end())
-                    {
-                        partners.push_back(other_v);
-                        distinct_partners.insert(other_v);
-                    }
-                }
-            }
-        }
-        if (partners.size() >= 2)
-            break; // Max 2 partners for a manifold edge
-    }
-    return partners;
+    if (face.x == v)
+        return {face.y, face.z};
+    if (face.y == v)
+        return {face.x, face.z};
+    if (face.z == v)
+        return {face.x, face.y};
+    return {-1, -1};
 }
 
-// Calculate edge contraction optimal position and cost using a local Laplacian energy approach
+// Calculate edge contraction optimal position and cost
 pair<vec3, double> compute_edge_cost(int v1_idx, int v2_idx)
 {
+    if (v1_idx >= vertices.size() || v2_idx >= vertices.size() ||
+        v1_idx < 0 || v2_idx < 0)
+    { // Basic sanity check
+        return {vec3(0.0f), std::numeric_limits<double>::max()};
+    }
     vec3 p1 = vertices[v1_idx];
     vec3 p2 = vertices[v2_idx];
 
-    // 1. Identify 1-ring neighbors of the edge (v1, v2)
     unordered_set<int> ring_indices;
     if (v1_idx < vertex_neighbors.size())
-    { // Check bounds
+    {
         for (int neighbor : vertex_neighbors[v1_idx])
         {
-            if (neighbor != v1_idx && neighbor != v2_idx)
-            {
+            if (neighbor != v2_idx)
                 ring_indices.insert(neighbor);
-            }
         }
     }
     if (v2_idx < vertex_neighbors.size())
-    { // Check bounds
+    {
         for (int neighbor : vertex_neighbors[v2_idx])
         {
-            if (neighbor != v1_idx && neighbor != v2_idx)
-            {
+            if (neighbor != v1_idx)
                 ring_indices.insert(neighbor);
-            }
         }
     }
 
     if (ring_indices.empty())
-    {                                   // Edge is isolated or connects two components with no other connections
-        return {(p1 + p2) * 0.5f, 0.0}; // Or a high cost if such collapses are undesirable
+    {
+        return {(p1 + p2) * 0.5f, 0.0}; // Or high cost
     }
 
-    // 2. Iteratively compute optimal position v_opt
     vec3 v_opt_current = (p1 + p2) * 0.5f;
-    vector<double> current_weights(vertices.size(), 0.0); // Store weights for final cost calculation
+    unordered_map<int, double> current_weights; // P_k_idx -> weight_k
 
     for (int iter = 0; iter < V_OPT_ITERATIONS; ++iter)
     {
         vec3 sum_weighted_positions(0.0f);
         double sum_weights = 0.0;
-
-        bool possible_to_calc_weights = true;
+        current_weights.clear();
 
         for (int P_k_idx : ring_indices)
         {
-            if (P_k_idx >= vertices.size())
-                continue; // Should not happen if graph is consistent
+            if (P_k_idx >= vertices.size() || P_k_idx < 0)
+                continue;
             vec3 P_k_pos = vertices[P_k_idx];
 
-            // Find triangle partners for the new edge (v_opt_current, P_k_pos)
-            std::vector<int> partners_idx = find_triangle_partners_for_new_edge(P_k_idx, v1_idx, v2_idx, ring_indices);
+            vector<int> partners_idx_list;
+            unordered_set<int> distinct_partners_set;
+
+            auto find_partners_for_pk = [&](int center_v_original_idx)
+            {
+                if (center_v_original_idx >= vertex_face_indices.size() || center_v_original_idx < 0)
+                    return;
+                for (int face_idx : vertex_face_indices[center_v_original_idx])
+                {
+                    if (face_idx >= faces.size() || face_idx < 0)
+                        continue;
+                    const ivec3 &f = faces[face_idx];
+                    pair<int, int> others = get_other_two_verts(f, center_v_original_idx); // Other two verts in face f besides center_v
+
+                    int potential_partner = -1;
+                    if (others.first == P_k_idx && ring_indices.count(others.second))
+                    {
+                        potential_partner = others.second;
+                    }
+                    else if (others.second == P_k_idx && ring_indices.count(others.first))
+                    {
+                        potential_partner = others.first;
+                    }
+
+                    if (potential_partner != -1 && potential_partner != P_k_idx)
+                    { // Partner must be in ring and not P_k itself
+                        if (distinct_partners_set.find(potential_partner) == distinct_partners_set.end())
+                        {
+                            partners_idx_list.push_back(potential_partner);
+                            distinct_partners_set.insert(potential_partner);
+                        }
+                    }
+                }
+            };
+
+            find_partners_for_pk(v1_idx);
+            find_partners_for_pk(v2_idx);
 
             double cotan_sum = 0.0;
-            if (partners_idx.size() >= 1)
+            for (int partner_vertex_idx : partners_idx_list)
             {
-                if (partners_idx[0] >= vertices.size())
+                if (partner_vertex_idx >= vertices.size() || partner_vertex_idx < 0)
                     continue;
-                vec3 P_partner1_pos = vertices[partners_idx[0]];
-                // Angle at P_partner1 in triangle (v_opt_current, P_k_pos, P_partner1_pos)
-                cotan_sum += cotangent_robust(v_opt_current - P_partner1_pos, P_k_pos - P_partner1_pos);
-            }
-            if (partners_idx.size() >= 2)
-            {
-                if (partners_idx[1] >= vertices.size())
-                    continue;
-                vec3 P_partner2_pos = vertices[partners_idx[1]];
-                // Angle at P_partner2 in triangle (v_opt_current, P_k_pos, P_partner2_pos)
-                cotan_sum += cotangent_robust(v_opt_current - P_partner2_pos, P_k_pos - P_partner2_pos);
+                vec3 P_partner_pos = vertices[partner_vertex_idx];
+                // Angle at P_partner_pos in triangle (v_opt_current, P_k_pos, P_partner_pos)
+                cotan_sum += cotangent_robust(v_opt_current - P_partner_pos, P_k_pos - P_partner_pos);
             }
 
             double weight_k = 0.0;
-            if (!partners_idx.empty())
-            {                               // If boundary edge, might only have one partner
-                weight_k = cotan_sum / 2.0; // Common factor
+            // If P_k forms two triangles in the new 1-ring of v_opt, there are two cotan terms.
+            // If P_k is on a boundary (of the 1-ring fan around v_opt), only one term.
+            // The sum is used directly. Common factor of 0.5 often appears if formula is sum(0.5 * cot * ||...||^2)
+            // Here we use w_k = sum_cotangents.
+            if (!partners_idx_list.empty())
+            {
+                weight_k = cotan_sum; // Or cotan_sum / 2.0 depending on formulation. Let's try direct sum.
             }
 
-            // Clamp weights to be positive (common practice)
-            weight_k = std::max((double)COT_EPSILON, weight_k);
+            weight_k = std::max((double)COT_EPSILON, weight_k); // Clamp weights
             current_weights[P_k_idx] = weight_k;
 
             sum_weighted_positions += (float)weight_k * P_k_pos;
@@ -216,16 +191,12 @@ pair<vec3, double> compute_edge_cost(int v1_idx, int v2_idx)
         }
 
         if (sum_weights < COT_EPSILON)
-        { // Not enough constraint or problematic weights
-            // Fallback: v_opt_current remains midpoint or previous value if iter > 0
-            // No update possible, break or use midpoint as final
+        {
             if (iter == 0)
-                v_opt_current = (p1 + p2) * 0.5f; // Ensure it's at least midpoint
+                v_opt_current = (p1 + p2) * 0.5f;
             break;
         }
-
         vec3 v_opt_next = sum_weighted_positions / (float)sum_weights;
-
         if (distance(v_opt_current, v_opt_next) < V_OPT_CONVERGENCE_THRESHOLD && iter > 0)
         {
             v_opt_current = v_opt_next;
@@ -234,276 +205,272 @@ pair<vec3, double> compute_edge_cost(int v1_idx, int v2_idx)
         v_opt_current = v_opt_next;
     }
 
-    // 3. Calculate final cost using the determined v_opt_current and final weights
     double cost = 0.0;
     for (int P_k_idx : ring_indices)
     {
-        if (P_k_idx >= vertices.size())
+        if (P_k_idx >= vertices.size() || P_k_idx < 0)
             continue;
         vec3 P_k_pos = vertices[P_k_idx];
-        double weight_k = current_weights[P_k_idx];
-        if (weight_k == 0.0)
-        {                                             // if weight was not set due to no partners etc., re-calculate or use default
-                                                      // This indicates an issue or an edge case not fully handled in weight calculation for v_opt iter.
-                                                      // For simplicity, let's assume weights were computed. If not, this might be a small default.
-                                                      // A more robust way would be to ensure all `current_weights[P_k_idx]` are properly set during iterations.
-                                                      // For now, let's use a minimal contribution if weight is zero.
-            cost += distance(v_opt_current, P_k_pos); // Or a factor of it
-        }
-        else
-        {
-            cost += weight_k * distance(v_opt_current, P_k_pos);
-        }
+        auto it = current_weights.find(P_k_idx);
+        double weight_k = (it != current_weights.end()) ? it->second : COT_EPSILON; // Use stored or default small
+        cost += weight_k * distance(v_opt_current, P_k_pos);
     }
-
-    // Normalize cost? Or scale? For now, raw energy.
-    // Cost can be very small if v_opt perfectly centers. Can be large if it causes high tension.
-    // A small penalty for collapsing to avoid issues with perfectly flat regions if cost is 0
     cost = std::max(cost, (double)COT_EPSILON * distance(p1, p2));
-
     return {v_opt_current, cost};
 }
 
-// Build adjacency list
-void build_adjacency()
+// Build vertex-vertex and vertex-face adjacencies
+void build_adjacency_and_face_indices()
 {
     int nV = vertices.size();
     vertex_neighbors.assign(nV, {});
-    for (const auto &f : faces)
+    vertex_face_indices.assign(nV, {});
+    for (int i = 0; i < faces.size(); ++i)
     {
-        if (f.x < nV && f.y < nV && f.z < nV && f.x >= 0 && f.y >= 0 && f.z >= 0)
-        {
-            vertex_neighbors[f.x].insert(f.y);
-            vertex_neighbors[f.x].insert(f.z);
-            vertex_neighbors[f.y].insert(f.x);
-            vertex_neighbors[f.y].insert(f.z);
-            vertex_neighbors[f.z].insert(f.x);
-            vertex_neighbors[f.z].insert(f.y);
-        }
-        else
-        {
-            // cerr << "Warning: Face with out-of-bounds vertex index during adjacency build." << endl;
-        }
+        const auto &f = faces[i];
+        if (f.x < 0 || f.x >= nV || f.y < 0 || f.y >= nV || f.z < 0 || f.z >= nV)
+            continue;
+
+        vertex_neighbors[f.x].insert(f.y);
+        vertex_neighbors[f.x].insert(f.z);
+        vertex_neighbors[f.y].insert(f.x);
+        vertex_neighbors[f.y].insert(f.z);
+        vertex_neighbors[f.z].insert(f.x);
+        vertex_neighbors[f.z].insert(f.y);
+
+        vertex_face_indices[f.x].insert(i);
+        vertex_face_indices[f.y].insert(i);
+        vertex_face_indices[f.z].insert(i);
     }
+    s_mesh_structures_valid = true;
 }
 
 // Initialize edge priority queue
 void init_edges()
 {
+    if (!s_mesh_structures_valid)
+    { // Should be called after build_adjacency_and_face_indices
+        // cerr << "Warning: init_edges called with invalid mesh structures." << endl;
+        build_adjacency_and_face_indices(); // Attempt to recover
+    }
+
     edge_map.clear();
     while (!edge_queue.empty())
         edge_queue.pop();
 
-    // Temporary adjacency build if not up-to-date (e.g., first call or after major changes)
-    // build_adjacency(); // Ensure vertex_neighbors is correct. Called by simplify/simplifyStep entry.
-
     for (int v = 0; v < vertices.size(); ++v)
     {
         if (v >= vertex_neighbors.size())
-            continue; // Should not happen
+            continue;
         for (int nb : vertex_neighbors[v])
         {
             if (nb >= vertices.size())
-                continue; // Should not happen
+                continue;
             if (v < nb)
-            { // Process each edge once
+            {
                 pair<vec3, double> edge_data = compute_edge_cost(v, nb);
                 Edge e{v, nb, edge_data.second, edge_data.first};
-                int64_t k = edge_key(v, nb);
-                edge_map[k] = e;
+                edge_map[edge_key(v, nb)] = e;
                 edge_queue.push(e);
             }
         }
     }
+    s_priority_queue_valid = true;
 }
 
-// Update edges related to a specific vertex v (after a contraction)
-void update_edges(int v)
+// Update edges related to vertex v and its neighbors
+void update_edges_for_vertex_and_its_neighbors(int v)
 {
-    if (v >= vertices.size() || v >= vertex_neighbors.size())
-        return; // Safety check
+    if (v >= vertices.size() || v < 0 || v >= vertex_neighbors.size())
+        return;
 
-    // First, remove old edges connected to v from the map (they will be re-added or are gone)
-    // This step is tricky because the map stores edges, and we need to iterate neighbors
-    // to find keys. Iterating `edge_map` and removing is safer if keys are complex.
-    // However, the current Q uses edges from `vertex_neighbors`, so recomputing for those is standard.
-
-    for (int nb : vertex_neighbors[v])
+    unordered_set<int> vertices_to_update;
+    vertices_to_update.insert(v);
+    for (int nb_of_v : vertex_neighbors[v])
     {
-        if (nb >= vertices.size())
+        vertices_to_update.insert(nb_of_v);
+    }
+
+    for (int current_v : vertices_to_update)
+    {
+        if (current_v >= vertices.size() || current_v < 0 || current_v >= vertex_neighbors.size())
             continue;
-
-        // remove old edge (v, nb) if it was in map from previous state.
-        // The priority queue might still have old versions; they'll be skipped.
-        // The map update is key.
-        int64_t old_k = edge_key(v, nb);
-        // edge_map.erase(old_k); // Erase might be too broad if some edges remain valid conceptually
-        // but cost changes. It's safer to overwrite or add.
-
-        pair<vec3, double> edge_data = compute_edge_cost(v, nb);
-        Edge e{v, nb, edge_data.second, edge_data.first};
-
-        int64_t k = edge_key(v, nb); // Key might involve old nb index if nb itself was merged into v.
-                                     // The edge is always between v and a current neighbor nb.
-        edge_map[k] = e;             // Update or insert
-        edge_queue.push(e);          // Add new one; old ones in PQ will be skipped due to cost mismatch or map check.
+        for (int nb : vertex_neighbors[current_v])
+        {
+            if (nb >= vertices.size() || nb < 0)
+                continue;
+            // Only recompute for edge (current_v, nb) once, and current_v must be less than nb to avoid double counting
+            // or re-evaluate all edges from current_v
+            // if (current_v < nb) { // This might miss edges if nb was also affected, simpler to update all from current_v
+            pair<vec3, double> edge_data = compute_edge_cost(current_v, nb);
+            Edge e{current_v, nb, edge_data.second, edge_data.first};
+            edge_map[edge_key(current_v, nb)] = e; // Update or insert
+            edge_queue.push(e);
+            // }
+        }
     }
 }
 
-// Contract edge e = (v1, v2) by moving v1 to e.optimal_pos and removing v2
+// Contract edge e = (v1, v2)
 bool contract_edge(const Edge &e)
 {
-    int v1 = e.v1; // Vertex to keep
-    int v2 = e.v2; // Vertex to remove
+    int v_keep = e.v1;   // Vertex to keep
+    int v_remove = e.v2; // Vertex to remove
 
-    if (v1 >= vertices.size() || v2 >= vertices.size() ||
-        v1 >= vertex_neighbors.size() || v2 >= vertex_neighbors.size())
-    {
-        return false; // Invalid indices
+    if (v_keep >= vertices.size() || v_remove >= vertices.size() || v_keep < 0 || v_remove < 0 ||
+        v_keep >= vertex_neighbors.size() || v_remove >= vertex_neighbors.size() || // Adjacency might not be full size if sparse
+        !vertex_neighbors[v_keep].count(v_remove))
+    { // Check if edge still exists
+        return false;
     }
 
-    // Check if edge still exists (v2 is a neighbor of v1)
-    if (!vertex_neighbors[v1].count(v2))
-    {
-        return false; // Edge was already removed by a previous contraction
-    }
+    unordered_set<int> old_v_remove_neighbors = vertex_neighbors[v_remove]; // Copy before modifying
 
-    vertices[v1] = e.optimal_pos;
-    // Quadric accumulation removed: quadrics[v1] += quadrics[v2];
+    vertices[v_keep] = e.optimal_pos;
 
-    // Update topology:
-    // For each neighbor 'nb' of v2:
-    //  - Remove v2 from nb's neighbors list.
-    //  - Add v1 to nb's neighbors list (if nb != v1).
-    //  - Add nb to v1's neighbors list (if nb != v1).
-    // Clear v2's neighbors list.
-    // Remove v2 from v1's neighbors list.
-
-    unordered_set<int> v2_neighbors_copy = vertex_neighbors[v2]; // Iterate on a copy
-
-    for (int nb_of_v2 : v2_neighbors_copy)
-    {
-        if (nb_of_v2 == v1)
-            continue; // Skip v1 itself
-
-        if (nb_of_v2 < vertex_neighbors.size())
-        {
-            vertex_neighbors[nb_of_v2].erase(v2);
-            vertex_neighbors[nb_of_v2].insert(v1);
-        }
-        vertex_neighbors[v1].insert(nb_of_v2); // Add nb_of_v2 to v1's neighbors
-    }
-
-    vertex_neighbors[v1].erase(v2); // v1 is no longer a neighbor of itself implicitly via v2
-    if (!vertex_neighbors[v2].empty())
-    {                                 // Check if not already cleared
-        vertex_neighbors[v2].clear(); // v2 is isolated
-    }
-
-    // Update faces: replace all occurrences of v2 with v1
-    // Remove degenerate faces (e.g., where two vertices become the same)
-    vector<ivec3> new_faces;
-    new_faces.reserve(faces.size());
+    // Rebuild faces list:
+    vector<ivec3> new_faces_list;
+    new_faces_list.reserve(faces.size());
     for (const auto &f : faces)
     {
         ivec3 new_f = f;
-        if (new_f.x == v2)
-            new_f.x = v1;
-        if (new_f.y == v2)
-            new_f.y = v1;
-        if (new_f.z == v2)
-            new_f.z = v1;
+        bool changed = false;
+        if (new_f.x == v_remove)
+        {
+            new_f.x = v_keep;
+            changed = true;
+        }
+        if (new_f.y == v_remove)
+        {
+            new_f.y = v_keep;
+            changed = true;
+        }
+        if (new_f.z == v_remove)
+        {
+            new_f.z = v_keep;
+            changed = true;
+        }
 
-        // Check for degenerate faces
         if (new_f.x != new_f.y && new_f.y != new_f.z && new_f.x != new_f.z)
         {
-            new_faces.push_back(new_f);
+            new_faces_list.push_back(new_f);
         }
     }
-    faces.swap(new_faces);
+    faces.swap(new_faces_list);
 
-    // After modifying topology around v1, update edges incident to v1
-    update_edges(v1);
+    // Adjacency structures are now stale. Rebuild them.
+    build_adjacency_and_face_indices(); // This is O(N_faces_new)
+    s_mesh_structures_valid = true;     // Rebuilt
 
-    // Update edges for neighbors of v2 that are now connected to v1
-    // These neighbors' edges costs might change due to v1's new position and connectivity
-    for (int nb_of_v2 : v2_neighbors_copy)
+    // Costs for edges around v_keep and former neighbors of v_remove are stale.
+    // update_edges_for_vertex_and_its_neighbors will recompute and push to PQ.
+    update_edges_for_vertex_and_its_neighbors(v_keep);
+    for (int old_nb_of_v_remove : old_v_remove_neighbors)
     {
-        if (nb_of_v2 != v1)
-        {                           // if nb_of_v2 became a new neighbor of v1
-            update_edges(nb_of_v2); // Recompute costs for edges incident to these neighbors
+        if (old_nb_of_v_remove != v_keep && old_nb_of_v_remove < vertices.size())
+        { // vertices.size check, as it might have been removed earlier by another op if cleanup not aggressive
+            update_edges_for_vertex_and_its_neighbors(old_nb_of_v_remove);
         }
     }
+    s_priority_queue_valid = true; // PQ has new items, stale ones will be ignored by map check
 
     return true;
 }
 
-// Cleanup unused vertices (those not part of any face)
+// Cleanup unused vertices
 void cleanup()
 {
+    id_map.clear();
     if (vertices.empty())
-        return;
-    int nV_old = vertices.size();
-    vector<bool> used(nV_old, false);
-    int current_max_idx = -1;
-    for (const auto &f : faces)
     {
-        used[f.x] = true;
-        used[f.y] = true;
-        used[f.z] = true;
-        current_max_idx = std::max({current_max_idx, f.x, f.y, f.z});
+        s_mesh_structures_valid = true; // Empty but valid
+        s_priority_queue_valid = false; // No edges
+        return;
     }
 
-    if (current_max_idx == -1 && !faces.empty())
-    { // Should not happen if faces exist
-        // cerr << "Warning: Max index is -1 but faces exist. Problem in face data." << endl;
-        return;
-    }
-    if (current_max_idx == -1 && faces.empty() && !vertices.empty())
-    { // No faces, clear all vertices
-        vertices.clear();
-        vertex_neighbors.clear(); // Also clear adjacency
-        return;
+    int nV_old = vertices.size();
+    vector<bool> used(nV_old, false);
+    int max_idx_in_faces = 0;
+    for (const auto &f : faces)
+    {
+        if (f.x < 0 || f.y < 0 || f.z < 0)
+            continue; // Should not happen with valid faces
+        max_idx_in_faces = std::max({max_idx_in_faces, f.x, f.y, f.z});
+        if (f.x < nV_old)
+            used[f.x] = true;
+        if (f.y < nV_old)
+            used[f.y] = true;
+        if (f.z < nV_old)
+            used[f.z] = true;
     }
 
     vector<vec3> new_vertices_list;
-    new_vertices_list.reserve(current_max_idx + 1);
-    vector<int> remap(nV_old, -1);
-    int new_idx_counter = 0;
+    vector<int> remap(max_idx_in_faces + 1, -1); // Ensure remap is large enough
+                                                 // Or remap based on nV_old if safer
+    if (nV_old > max_idx_in_faces + 1)
+        remap.resize(nV_old, -1);
 
-    for (int i = 0; i <= current_max_idx; ++i)
-    { // Iterate only up to max_idx seen in faces
-        if (i < nV_old && used[i])
-        { // Ensure 'i' is a valid old index
-            remap[i] = new_idx_counter;
+    int current_new_idx = 0;
+    for (int i = 0; i < nV_old; ++i)
+    { // Iterate old vertex indices
+        if (used[i])
+        {
+            if (i < remap.size())
+            {
+                remap[i] = current_new_idx;
+                id_map[i] = current_new_idx;
+            }
+            else
+            { /* Error: remap array too small, vertex index out of expected bounds */
+            }
             new_vertices_list.push_back(vertices[i]);
-            new_idx_counter++;
+            current_new_idx++;
         }
     }
 
     for (auto &f : faces)
     {
-        f.x = remap[f.x];
-        f.y = remap[f.y];
-        f.z = remap[f.z];
+        if (f.x < remap.size())
+            f.x = remap[f.x];
+        else
+            f.x = -1; // Mark invalid if out of bound
+        if (f.y < remap.size())
+            f.y = remap[f.y];
+        else
+            f.y = -1;
+        if (f.z < remap.size())
+            f.z = remap[f.z];
+        else
+            f.z = -1;
         if (f.x == -1 || f.y == -1 || f.z == -1)
         {
-            // This would indicate an issue, face references a removed vertex not properly handled.
-            // cerr << "Error during cleanup: Face references remapped -1 index." << endl;
+            // This face is now invalid, should be removed.
+            // For simplicity, let's assume this leads to degenerate check later or filter here.
         }
     }
+    // Filter out faces that became invalid due to remapping issues
+    faces.erase(std::remove_if(faces.begin(), faces.end(), [](const ivec3 &f)
+                               { return f.x == -1 || f.y == -1 || f.z == -1 || f.x == f.y || f.y == f.z || f.x == f.z; }),
+                faces.end());
+
     vertices.swap(new_vertices_list);
 
-    // Rebuild adjacency for the cleaned mesh
-    // build_adjacency(); // Important if simplify/simplifyStep doesn't call it first
+    // After cleanup, all adjacencies and PQ are invalid because indices changed.
+    s_mesh_structures_valid = false; // Needs rebuild_adjacency_and_face_indices
+    s_priority_queue_valid = false;  // Needs init_edges
 }
 
 // Main simplification function
 void simplify(float targetRatio)
 {
-    // No init_quadrics() needed
-    build_adjacency(); // Build initial adjacency list
-    init_edges();      // Populate priority queue with initial edge costs
+    if (!s_mesh_structures_valid)
+    { // If SetMesh wasn't called or structures invalidated
+        build_adjacency_and_face_indices();
+    }
+    if (!s_priority_queue_valid)
+    { // If PQ is not reflecting current mesh (e.g. after cleanup)
+        init_edges();
+    }
 
     int initial_faces = faces.size();
     if (initial_faces == 0)
@@ -513,7 +480,7 @@ void simplify(float targetRatio)
         target_num_faces = 0;
 
     int contractions = 0;
-    const int max_contractions = initial_faces; // Heuristic limit
+    const int max_contractions = initial_faces;
 
     while (faces.size() > target_num_faces && !edge_queue.empty() && contractions < max_contractions)
     {
@@ -521,81 +488,91 @@ void simplify(float targetRatio)
         edge_queue.pop();
 
         int64_t k = edge_key(e.v1, e.v2);
-
-        // Check if edge is still valid and its cost is up-to-date in the map
         auto it = edge_map.find(k);
+
         if (it == edge_map.end() || fabs(it->second.cost - e.cost) > 1e-9)
         {
-            continue; // Stale edge from priority queue
+            continue; // Stale edge from PQ
         }
-        // Additional check: ensure vertices still exist (not cleaned up unexpectedly)
+        // Additional check: ensure vertices and edge still valid in current (possibly modified) graph
         if (e.v1 >= vertices.size() || e.v2 >= vertices.size() ||
-            e.v1 >= vertex_neighbors.size() || e.v2 >= vertex_neighbors.size() ||
+            e.v1 < 0 || e.v2 < 0 ||
+            e.v1 >= vertex_neighbors.size() || e.v2 >= vertex_neighbors.size() || // vertex_neighbors might shrink
             !vertex_neighbors[e.v1].count(e.v2))
-        {                       // Ensure they are still neighbors
-            edge_map.erase(it); // Remove from map as it's invalid
+        {
+            edge_map.erase(it);
             continue;
         }
 
         if (contract_edge(e))
         {
-            edge_map.erase(k); // Edge successfully contracted, remove from map
+            edge_map.erase(k);
             contractions++;
         }
         else
         {
-            // Contraction failed (e.g. edge became invalid between pop and contract)
-            // Remove from map to prevent further attempts on this stale version
-            edge_map.erase(it);
+            edge_map.erase(it); // Contraction failed, remove from map
         }
     }
-    cleanup();         // Remove unused vertices and remap indices
-    build_adjacency(); // Rebuild adjacency for the final cleaned mesh
+    cleanup(); // Final cleanup
+    // After cleanup, structures need rebuild if GetMesh is called or another simplify op.
+    // Let GetMesh handles ensure structures are fine, or user calls SetMesh again.
+    // For now, `simplify` leaves `s_mesh_structures_valid` potentially false (due to cleanup).
 }
 
 // Single step simplification
 void simplifyStep()
 {
-    // No init_quadrics()
-    build_adjacency(); // Ensure adjacency is up-to-date before computing costs
-    init_edges();      // Recalculate all edge costs and repopulate queue
-
-    if (!edge_queue.empty())
+    if (!s_mesh_structures_valid)
     {
-        Edge e = edge_queue.top();
-        // Popping here means if contract_edge fails, this edge is lost for this step.
-        // This matches QEM's behavior. For interactive use, might peek instead.
+        build_adjacency_and_face_indices();
+    }
+    if (!s_priority_queue_valid)
+    {
+        init_edges();
+    }
+
+    if (edge_queue.empty())
+        return;
+
+    Edge e = {-1, -1, 0, vec3(0)};
+    bool found_valid_edge = false;
+
+    // Pop until a valid edge is found or queue is empty
+    while (!edge_queue.empty())
+    {
+        e = edge_queue.top();
         edge_queue.pop();
-
         int64_t k = edge_key(e.v1, e.v2);
-
         auto it = edge_map.find(k);
+
         if (it == edge_map.end() || fabs(it->second.cost - e.cost) > 1e-9)
         {
-            // Stale edge, typically we'd loop in simplify() to find the next best.
-            // For simplifyStep(), if the top is stale, we might not simplify this step.
-            return;
+            continue; // Stale
         }
         if (e.v1 >= vertices.size() || e.v2 >= vertices.size() ||
+            e.v1 < 0 || e.v2 < 0 ||
             e.v1 >= vertex_neighbors.size() || e.v2 >= vertex_neighbors.size() ||
             !vertex_neighbors[e.v1].count(e.v2))
         {
             edge_map.erase(it);
-            return;
+            continue; // Invalid
         }
-
+        found_valid_edge = true;
+        best_edge = e; // Store original indices for GetActiveVertices
         if (contract_edge(e))
         {
             edge_map.erase(k);
-            best_edge = e; // Store the contracted edge
         }
         else
         {
-            edge_map.erase(it);
+            edge_map.erase(it); // Contraction failed for some reason
         }
+        break;
     }
-    cleanup();
-    build_adjacency(); // Rebuild for next step
+
+    cleanup(); // Cleanup after the step
+    // s_mesh_structures_valid and s_priority_queue_valid will be false now.
 }
 
 // --- C Interface ---
@@ -605,30 +582,39 @@ extern "C"
     {
         vertices.assign(inV, inV + nV);
         faces.assign(inF, inF + nF);
-        // Clear any old state
+
         edge_map.clear();
         while (!edge_queue.empty())
             edge_queue.pop();
         vertex_neighbors.clear();
+        vertex_face_indices.clear();
         best_edge = Edge{-1, -1, 0.0, vec3(0.0f)};
+
+        s_mesh_structures_valid = false; // Force rebuild on first operation
+        s_priority_queue_valid = false;
         return 0;
     }
 
-    // Important: These Get* functions return pointers to static buffers.
-    // This is not thread-safe and data is overwritten on subsequent calls.
-    // Common for simple C interfaces but be aware.
     vec3 *GetMeshVertices(int *outV)
     {
+        if (!s_mesh_structures_valid)
+        { // If cleanup was last op, adjacencies need rebuild for consistency
+            build_adjacency_and_face_indices();
+        }
         *outV = vertices.size();
-        static vector<vec3> buf_v; // static buffer
+        static vector<vec3> buf_v;
         buf_v = vertices;
         return buf_v.data();
     }
 
     ivec3 *GetMeshFaces(int *outF)
     {
+        if (!s_mesh_structures_valid)
+        {
+            build_adjacency_and_face_indices();
+        }
         *outF = faces.size();
-        static vector<ivec3> buf_f; // static buffer
+        static vector<ivec3> buf_f;
         buf_f = faces;
         return buf_f.data();
     }
@@ -643,14 +629,14 @@ extern "C"
         simplifyStep();
     }
 
-    // Returns pointer to a static buffer containing {v1, v2} of last best_edge.
-    // v1 is the vertex that was kept and moved, v2 was removed.
     int *GetActiveVertices()
     {
-        static vector<int> buf_active_v(2);
-        buf_active_v[0] = best_edge.v1; // The vertex that 'absorbed' v2
-        buf_active_v[1] = best_edge.v2; // The vertex that was removed
-        return buf_active_v.data();
+        static vector<int> buf;
+        buf.clear();
+        buf.push_back(best_edge.v1);
+        buf.push_back(best_edge.v2);
+        buf.push_back(id_map[best_edge.v1]);
+        return buf.data();
     }
 }
 
