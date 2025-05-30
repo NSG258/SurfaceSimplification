@@ -4,7 +4,7 @@ import os
 
 libpath = os.path.dirname(os.path.abspath(__file__))
 # Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.dll'))
-Processor = cdll.LoadLibrary(os.path.join(libpath, 'lindstrom_turk.so'))
+Processor = cdll.LoadLibrary(os.path.join(libpath, 'structure_aware.so'))
 
 
 
