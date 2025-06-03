@@ -786,16 +786,18 @@ void shape_preserve_structure_decimation(int k, int target_collapses)
 // Single step structure-aware simplification
 void structure_aware_simplify_step()
 {
-    if (edge_queue.empty())
-    {
-        initialize_proxies();
-        calculate_planar_proxy_equations();
-        init_structure_quadrics();
-        build_adjacency();
-        init_structure_edges();
-    }
+    shape_preserve_flag = true;
+    modify_cost = true;
 
-    if (!edge_queue.empty())
+    initialize_proxies();
+    calculate_planar_proxy_equations();
+    init_structure_quadrics();
+    build_adjacency();
+    init_structure_edges();
+
+    int targetFaces = int(faces.size() - 1);
+
+    while (faces.size() > targetFaces && !edge_queue.empty())
     {
         StructureEdge e = edge_queue.top();
         edge_queue.pop();
@@ -803,7 +805,7 @@ void structure_aware_simplify_step()
         int64_t k = edge_key(e.v1, e.v2);
         if (!edge_map.count(k) || fabs(edge_map[k].cost - e.cost) > 1e-9)
         {
-            return;
+            continue;
         }
 
         if (contract_structure_edge(e))
@@ -812,6 +814,8 @@ void structure_aware_simplify_step()
             best_edge = e;
         }
     }
+
+    cleanup_vertices();
 }
 
 // External C interface
