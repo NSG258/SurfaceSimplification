@@ -1,5 +1,5 @@
-#ifndef MESH_SIMPLIFICATION_CPP
-#define MESH_SIMPLIFICATION_CPP
+#ifndef SPECTRAL_SIMPLIFICATION_CPP
+#define SPECTRAL_SIMPLIFICATION_CPP
 
 #include <iostream>
 #include <vector>
@@ -8,18 +8,15 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
-#include <cstdint> // for int64_t, uint32_t
+#include <cstdint>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 
 using namespace std;
 using namespace glm;
 
-const float COT_EPSILON = 1e-6f;
-const int V_OPT_ITERATIONS = 5;
-const float V_OPT_CONVERGENCE_THRESHOLD = 1e-5f;
-
-// Edge structure definition
+// 边结构定义
 struct Edge
 {
     int v1, v2;
@@ -28,21 +25,26 @@ struct Edge
     bool operator>(const Edge &o) const { return cost > o.cost; }
 };
 
-// Global data
+// 全局数据
 static vector<vec3> vertices;
 static vector<ivec3> faces;
+static vector<vector<float>> laplacian_matrix;
+static vector<vector<float>> eigenvectors;
+static vector<float> eigenvalues;
+static vector<float> vertex_importance;
 static priority_queue<Edge, vector<Edge>, greater<Edge>> edge_queue;
 static unordered_map<int64_t, Edge> edge_map;
-static vector<unordered_set<int>> vertex_neighbors;    // vertex_idx -> set of neighbor vertex_indices
-static vector<unordered_set<int>> vertex_face_indices; // vertex_idx -> set of incident face_indices (indices into `faces` vector)
+static vector<unordered_set<int>> vertex_neighbors;
+static vector<float> vertex_areas;
 static Edge best_edge;
 static unordered_map<int, int> id_map; // <old_id, new_id>
 
-// Global state flags
-static bool s_mesh_structures_valid = false; // Are vertices, faces, vertex_neighbors, vertex_face_indices up-to-date?
-static bool s_priority_queue_valid = false;  // Is edge_queue and edge_map reflecting current mesh state?
+// 谱简化参数
+static int num_eigenvectors = 10;
+static float spectral_weight = 100.0f;
+static float geometric_weight = 1.0f;
 
-// Calculate unique edge key
+// 计算唯一边键
 inline int64_t edge_key(int a, int b)
 {
     if (a > b)
@@ -50,583 +52,453 @@ inline int64_t edge_key(int a, int b)
     return ((int64_t)a << 32) | (uint32_t)b;
 }
 
-// Robust cotangent of angle <apb (angle at p)
-float cotangent_robust(const vec3 &v_pa, const vec3 &v_pb)
+// 计算顶点面积权重（使用混合面积）
+void compute_vertex_areas()
 {
-    float dot_product = dot(v_pa, v_pb);
-    float cross_product_mag = length(cross(v_pa, v_pb));
+    int nV = vertices.size();
+    vertex_areas.assign(nV, 0.0f);
 
-    if (cross_product_mag < COT_EPSILON)
+    for (const auto &face : faces)
     {
-        return (dot_product > 0) ? (1.0f / COT_EPSILON) : (-1.0f / COT_EPSILON);
+        vec3 v0 = vertices[face.x];
+        vec3 v1 = vertices[face.y];
+        vec3 v2 = vertices[face.z];
+
+        vec3 e1 = v1 - v0;
+        vec3 e2 = v2 - v0;
+        float area = length(cross(e1, e2)) * 0.5f;
+
+        // 分配1/3面积给每个顶点
+        vertex_areas[face.x] += area / 3.0f;
+        vertex_areas[face.y] += area / 3.0f;
+        vertex_areas[face.z] += area / 3.0f;
     }
-    return dot_product / cross_product_mag;
 }
 
-// Helper to get the other two vertices from a face given one vertex
-// Returns {-1, -1} if v is not in the face.
-std::pair<int, int> get_other_two_verts(const ivec3 &face, int v)
+// 构建拉普拉斯矩阵（余切权重）
+void build_laplacian_matrix()
 {
-    if (face.x == v)
-        return {face.y, face.z};
-    if (face.y == v)
-        return {face.x, face.z};
-    if (face.z == v)
-        return {face.x, face.y};
-    return {-1, -1};
+    int nV = vertices.size();
+    laplacian_matrix.assign(nV, vector<float>(nV, 0.0f));
+
+    // 计算余切权重
+    for (const auto &face : faces)
+    {
+        int i = face.x, j = face.y, k = face.z;
+        vec3 vi = vertices[i], vj = vertices[j], vk = vertices[k];
+
+        // 计算三个角的余切值
+        vec3 eij = vj - vi, eik = vk - vi;
+        vec3 eji = vi - vj, ejk = vk - vj;
+        vec3 eki = vi - vk, ekj = vj - vk;
+
+        float cot_k = dot(eik, ekj) / length(cross(eik, ekj));
+        float cot_i = dot(eij, eik) / length(cross(eij, eik));
+        float cot_j = dot(eji, ejk) / length(cross(eji, ejk));
+
+        // 添加权重到拉普拉斯矩阵
+        laplacian_matrix[i][j] += cot_k * 0.5f;
+        laplacian_matrix[j][i] += cot_k * 0.5f;
+        laplacian_matrix[j][k] += cot_i * 0.5f;
+        laplacian_matrix[k][j] += cot_i * 0.5f;
+        laplacian_matrix[k][i] += cot_j * 0.5f;
+        laplacian_matrix[i][k] += cot_j * 0.5f;
+    }
+
+    // 设置对角线元素
+    for (int i = 0; i < nV; ++i)
+    {
+        float sum = 0.0f;
+        for (int j = 0; j < nV; ++j)
+        {
+            if (i != j)
+                sum += laplacian_matrix[i][j];
+        }
+        laplacian_matrix[i][i] = -sum;
+    }
 }
 
-// Calculate edge contraction optimal position and cost
-pair<vec3, double> compute_edge_cost(int v1_idx, int v2_idx)
+// 幂迭代法计算特征向量
+vector<float> power_iteration(const vector<vector<float>> &matrix, int max_iter = 100)
 {
-    if (v1_idx >= vertices.size() || v2_idx >= vertices.size() ||
-        v1_idx < 0 || v2_idx < 0)
-    { // Basic sanity check
-        return {vec3(0.0f), std::numeric_limits<double>::max()};
-    }
-    vec3 p1 = vertices[v1_idx];
-    vec3 p2 = vertices[v2_idx];
+    int n = matrix.size();
+    vector<float> v(n, 1.0f);
 
-    unordered_set<int> ring_indices;
-    if (v1_idx < vertex_neighbors.size())
+    for (int iter = 0; iter < max_iter; ++iter)
     {
-        for (int neighbor : vertex_neighbors[v1_idx])
+        vector<float> Av(n, 0.0f);
+        for (int i = 0; i < n; ++i)
         {
-            if (neighbor != v2_idx)
-                ring_indices.insert(neighbor);
-        }
-    }
-    if (v2_idx < vertex_neighbors.size())
-    {
-        for (int neighbor : vertex_neighbors[v2_idx])
-        {
-            if (neighbor != v1_idx)
-                ring_indices.insert(neighbor);
-        }
-    }
-
-    if (ring_indices.empty())
-    {
-        return {(p1 + p2) * 0.5f, 0.0}; // Or high cost
-    }
-
-    vec3 v_opt_current = (p1 + p2) * 0.5f;
-    unordered_map<int, double> current_weights; // P_k_idx -> weight_k
-
-    for (int iter = 0; iter < V_OPT_ITERATIONS; ++iter)
-    {
-        vec3 sum_weighted_positions(0.0f);
-        double sum_weights = 0.0;
-        current_weights.clear();
-
-        for (int P_k_idx : ring_indices)
-        {
-            if (P_k_idx >= vertices.size() || P_k_idx < 0)
-                continue;
-            vec3 P_k_pos = vertices[P_k_idx];
-
-            vector<int> partners_idx_list;
-            unordered_set<int> distinct_partners_set;
-
-            auto find_partners_for_pk = [&](int center_v_original_idx)
+            for (int j = 0; j < n; ++j)
             {
-                if (center_v_original_idx >= vertex_face_indices.size() || center_v_original_idx < 0)
-                    return;
-                for (int face_idx : vertex_face_indices[center_v_original_idx])
-                {
-                    if (face_idx >= faces.size() || face_idx < 0)
-                        continue;
-                    const ivec3 &f = faces[face_idx];
-                    pair<int, int> others = get_other_two_verts(f, center_v_original_idx); // Other two verts in face f besides center_v
-
-                    int potential_partner = -1;
-                    if (others.first == P_k_idx && ring_indices.count(others.second))
-                    {
-                        potential_partner = others.second;
-                    }
-                    else if (others.second == P_k_idx && ring_indices.count(others.first))
-                    {
-                        potential_partner = others.first;
-                    }
-
-                    if (potential_partner != -1 && potential_partner != P_k_idx)
-                    { // Partner must be in ring and not P_k itself
-                        if (distinct_partners_set.find(potential_partner) == distinct_partners_set.end())
-                        {
-                            partners_idx_list.push_back(potential_partner);
-                            distinct_partners_set.insert(potential_partner);
-                        }
-                    }
-                }
-            };
-
-            find_partners_for_pk(v1_idx);
-            find_partners_for_pk(v2_idx);
-
-            double cotan_sum = 0.0;
-            for (int partner_vertex_idx : partners_idx_list)
-            {
-                if (partner_vertex_idx >= vertices.size() || partner_vertex_idx < 0)
-                    continue;
-                vec3 P_partner_pos = vertices[partner_vertex_idx];
-                // Angle at P_partner_pos in triangle (v_opt_current, P_k_pos, P_partner_pos)
-                cotan_sum += cotangent_robust(v_opt_current - P_partner_pos, P_k_pos - P_partner_pos);
+                Av[i] += matrix[i][j] * v[j];
             }
-
-            double weight_k = 0.0;
-            // If P_k forms two triangles in the new 1-ring of v_opt, there are two cotan terms.
-            // If P_k is on a boundary (of the 1-ring fan around v_opt), only one term.
-            // The sum is used directly. Common factor of 0.5 often appears if formula is sum(0.5 * cot * ||...||^2)
-            // Here we use w_k = sum_cotangents.
-            if (!partners_idx_list.empty())
-            {
-                weight_k = cotan_sum; // Or cotan_sum / 2.0 depending on formulation. Let's try direct sum.
-            }
-
-            weight_k = std::max((double)COT_EPSILON, weight_k); // Clamp weights
-            current_weights[P_k_idx] = weight_k;
-
-            sum_weighted_positions += (float)weight_k * P_k_pos;
-            sum_weights += weight_k;
         }
 
-        if (sum_weights < COT_EPSILON)
+        // 归一化
+        float norm = 0.0f;
+        for (float x : Av)
+            norm += x * x;
+        norm = sqrt(norm);
+
+        if (norm > 1e-10f)
         {
-            if (iter == 0)
-                v_opt_current = (p1 + p2) * 0.5f;
-            break;
+            for (int i = 0; i < n; ++i)
+                v[i] = Av[i] / norm;
         }
-        vec3 v_opt_next = sum_weighted_positions / (float)sum_weights;
-        if (distance(v_opt_current, v_opt_next) < V_OPT_CONVERGENCE_THRESHOLD && iter > 0)
-        {
-            v_opt_current = v_opt_next;
-            break;
-        }
-        v_opt_current = v_opt_next;
     }
 
-    double cost = 0.0;
-    for (int P_k_idx : ring_indices)
-    {
-        if (P_k_idx >= vertices.size() || P_k_idx < 0)
-            continue;
-        vec3 P_k_pos = vertices[P_k_idx];
-        auto it = current_weights.find(P_k_idx);
-        double weight_k = (it != current_weights.end()) ? it->second : COT_EPSILON; // Use stored or default small
-        cost += weight_k * distance(v_opt_current, P_k_pos);
-    }
-    cost = std::max(cost, (double)COT_EPSILON * distance(p1, p2));
-    return {v_opt_current, cost};
+    return v;
 }
 
-// Build vertex-vertex and vertex-face adjacencies
-void build_adjacency_and_face_indices()
+// 简化的特征分解（仅计算几个主要特征向量）
+void compute_eigenvectors()
+{
+    int nV = vertices.size();
+    eigenvectors.clear();
+    eigenvalues.clear();
+
+    // 使用修正的拉普拉斯矩阵进行特征分解
+    vector<vector<float>> L = laplacian_matrix;
+
+    // 计算前几个特征向量
+    for (int k = 0; k < std::min(num_eigenvectors, nV); ++k)
+    {
+        vector<float> eigenvec = power_iteration(L);
+        eigenvectors.push_back(eigenvec);
+
+        // 计算特征值
+        float eigenval = 0.0f;
+        for (int i = 0; i < nV; ++i)
+        {
+            float Lv_i = 0.0f;
+            for (int j = 0; j < nV; ++j)
+            {
+                Lv_i += L[i][j] * eigenvec[j];
+            }
+            eigenval += eigenvec[i] * Lv_i;
+        }
+        eigenvalues.push_back(eigenval);
+
+        // 从矩阵中移除这个特征向量的贡献
+        for (int i = 0; i < nV; ++i)
+        {
+            for (int j = 0; j < nV; ++j)
+            {
+                L[i][j] -= eigenval * eigenvec[i] * eigenvec[j];
+            }
+        }
+    }
+}
+
+// 计算顶点的谱重要性
+void compute_vertex_importance()
+{
+    int nV = vertices.size();
+    vertex_importance.assign(nV, 0.0f);
+
+    // 基于低频特征向量计算重要性
+    for (int v = 0; v < nV; ++v)
+    {
+        float importance = 0.0f;
+        for (int k = 0; k < eigenvectors.size(); ++k)
+        {
+            // 权重与特征值成反比（低频更重要）
+            float weight = 1.0f / (abs(eigenvalues[k]) + 1e-6f);
+            importance += weight * abs(eigenvectors[k][v]);
+        }
+        vertex_importance[v] = importance;
+    }
+
+    // 归一化重要性值
+    float max_importance = *max_element(vertex_importance.begin(), vertex_importance.end());
+    if (max_importance > 1e-10f)
+    {
+        for (float &imp : vertex_importance)
+            imp /= max_importance;
+    }
+}
+
+// 计算谱距离
+float compute_spectral_distance(int v1, int v2)
+{
+    float dist = 0.0f;
+    for (int k = 0; k < eigenvectors.size(); ++k)
+    {
+        float diff = eigenvectors[k][v1] - eigenvectors[k][v2];
+        dist += diff * diff;
+    }
+    return sqrt(dist);
+}
+
+// 计算谱边收缩代价
+pair<vec3, double> compute_spectral_cost(int v1, int v2)
+{
+    // 几何代价（基础二次误差）
+    vec3 pos1 = vertices[v1];
+    vec3 pos2 = vertices[v2];
+    vec3 mid_pos = 0.5f * (pos1 + pos2);
+
+    float geometric_cost = length(pos1 - pos2);
+
+    // 谱代价
+    float spectral_dist = compute_spectral_distance(v1, v2);
+    float importance_penalty = vertex_importance[v1] + vertex_importance[v2];
+    float spectral_cost = spectral_dist * importance_penalty;
+
+    // 组合代价
+    double total_cost = geometric_weight * geometric_cost +
+                        spectral_weight * spectral_cost;
+
+    return {mid_pos, total_cost};
+}
+
+// 建立邻接表
+void build_adjacency()
 {
     int nV = vertices.size();
     vertex_neighbors.assign(nV, {});
-    vertex_face_indices.assign(nV, {});
-    for (int i = 0; i < faces.size(); ++i)
-    {
-        const auto &f = faces[i];
-        if (f.x < 0 || f.x >= nV || f.y < 0 || f.y >= nV || f.z < 0 || f.z >= nV)
-            continue;
 
+    for (const auto &f : faces)
+    {
         vertex_neighbors[f.x].insert(f.y);
         vertex_neighbors[f.x].insert(f.z);
         vertex_neighbors[f.y].insert(f.x);
         vertex_neighbors[f.y].insert(f.z);
         vertex_neighbors[f.z].insert(f.x);
         vertex_neighbors[f.z].insert(f.y);
-
-        vertex_face_indices[f.x].insert(i);
-        vertex_face_indices[f.y].insert(i);
-        vertex_face_indices[f.z].insert(i);
     }
-    s_mesh_structures_valid = true;
 }
 
-// Initialize edge priority queue
+// 初始化边优先队列
 void init_edges()
 {
-    if (!s_mesh_structures_valid)
-    { // Should be called after build_adjacency_and_face_indices
-        // cerr << "Warning: init_edges called with invalid mesh structures." << endl;
-        build_adjacency_and_face_indices(); // Attempt to recover
-    }
-
     edge_map.clear();
     while (!edge_queue.empty())
         edge_queue.pop();
 
     for (int v = 0; v < vertices.size(); ++v)
     {
-        if (v >= vertex_neighbors.size())
-            continue;
         for (int nb : vertex_neighbors[v])
         {
-            if (nb >= vertices.size())
-                continue;
             if (v < nb)
             {
-                pair<vec3, double> edge_data = compute_edge_cost(v, nb);
-                Edge e{v, nb, edge_data.second, edge_data.first};
-                edge_map[edge_key(v, nb)] = e;
+                auto [optP, cost] = compute_spectral_cost(v, nb);
+                Edge e{v, nb, cost, optP};
+                int64_t k = edge_key(v, nb);
+                edge_map[k] = e;
                 edge_queue.push(e);
             }
         }
     }
-    s_priority_queue_valid = true;
 }
 
-// Update edges related to vertex v and its neighbors
-void update_edges_for_vertex_and_its_neighbors(int v)
+// 更新给定顶点相关边
+void update_edges(int v)
 {
-    if (v >= vertices.size() || v < 0 || v >= vertex_neighbors.size())
-        return;
-
-    unordered_set<int> vertices_to_update;
-    vertices_to_update.insert(v);
-    for (int nb_of_v : vertex_neighbors[v])
+    for (int nb : vertex_neighbors[v])
     {
-        vertices_to_update.insert(nb_of_v);
-    }
-
-    for (int current_v : vertices_to_update)
-    {
-        if (current_v >= vertices.size() || current_v < 0 || current_v >= vertex_neighbors.size())
-            continue;
-        for (int nb : vertex_neighbors[current_v])
-        {
-            if (nb >= vertices.size() || nb < 0)
-                continue;
-            // Only recompute for edge (current_v, nb) once, and current_v must be less than nb to avoid double counting
-            // or re-evaluate all edges from current_v
-            // if (current_v < nb) { // This might miss edges if nb was also affected, simpler to update all from current_v
-            pair<vec3, double> edge_data = compute_edge_cost(current_v, nb);
-            Edge e{current_v, nb, edge_data.second, edge_data.first};
-            edge_map[edge_key(current_v, nb)] = e; // Update or insert
-            edge_queue.push(e);
-            // }
-        }
+        int64_t k = edge_key(v, nb);
+        auto [optP, cost] = compute_spectral_cost(v, nb);
+        Edge e{v, nb, cost, optP};
+        edge_map[k] = e;
+        edge_queue.push(e);
     }
 }
 
-// Contract edge e = (v1, v2)
+// 收缩边
 bool contract_edge(const Edge &e)
 {
-    int v_keep = e.v1;   // Vertex to keep
-    int v_remove = e.v2; // Vertex to remove
-
-    if (v_keep >= vertices.size() || v_remove >= vertices.size() || v_keep < 0 || v_remove < 0 ||
-        v_keep >= vertex_neighbors.size() || v_remove >= vertex_neighbors.size() || // Adjacency might not be full size if sparse
-        !vertex_neighbors[v_keep].count(v_remove))
-    { // Check if edge still exists
+    int v1 = e.v1, v2 = e.v2;
+    if (!vertex_neighbors[v1].count(v2))
         return false;
-    }
 
-    unordered_set<int> old_v_remove_neighbors = vertex_neighbors[v_remove]; // Copy before modifying
+    // 更新顶点位置
+    vertices[v1] = e.optimal_pos;
 
-    vertices[v_keep] = e.optimal_pos;
+    // 更新顶点重要性（简单平均）
+    vertex_importance[v1] = (vertex_importance[v1] + vertex_importance[v2]) * 0.5f;
 
-    // Rebuild faces list:
-    vector<ivec3> new_faces_list;
-    new_faces_list.reserve(faces.size());
-    for (const auto &f : faces)
+    // 更新邻接关系
+    for (int nb : vertex_neighbors[v2])
     {
-        ivec3 new_f = f;
-        bool changed = false;
-        if (new_f.x == v_remove)
-        {
-            new_f.x = v_keep;
-            changed = true;
-        }
-        if (new_f.y == v_remove)
-        {
-            new_f.y = v_keep;
-            changed = true;
-        }
-        if (new_f.z == v_remove)
-        {
-            new_f.z = v_keep;
-            changed = true;
-        }
-
-        if (new_f.x != new_f.y && new_f.y != new_f.z && new_f.x != new_f.z)
-        {
-            new_faces_list.push_back(new_f);
-        }
+        if (nb == v1)
+            continue;
+        vertex_neighbors[v1].insert(nb);
+        vertex_neighbors[nb].erase(v2);
+        vertex_neighbors[nb].insert(v1);
     }
-    faces.swap(new_faces_list);
+    vertex_neighbors[v1].erase(v2);
+    vertex_neighbors[v2].clear();
 
-    // Adjacency structures are now stale. Rebuild them.
-    build_adjacency_and_face_indices(); // This is O(N_faces_new)
-    s_mesh_structures_valid = true;     // Rebuilt
-
-    // Costs for edges around v_keep and former neighbors of v_remove are stale.
-    // update_edges_for_vertex_and_its_neighbors will recompute and push to PQ.
-    update_edges_for_vertex_and_its_neighbors(v_keep);
-    for (int old_nb_of_v_remove : old_v_remove_neighbors)
+    // 更新面
+    vector<ivec3> newF;
+    newF.reserve(faces.size());
+    for (auto &f : faces)
     {
-        if (old_nb_of_v_remove != v_keep && old_nb_of_v_remove < vertices.size())
-        { // vertices.size check, as it might have been removed earlier by another op if cleanup not aggressive
-            update_edges_for_vertex_and_its_neighbors(old_nb_of_v_remove);
-        }
-    }
-    s_priority_queue_valid = true; // PQ has new items, stale ones will be ignored by map check
+        ivec3 nf = f;
+        if (nf.x == v2)
+            nf.x = v1;
+        if (nf.y == v2)
+            nf.y = v1;
+        if (nf.z == v2)
+            nf.z = v1;
 
+        // 去除退化面
+        if (nf.x != nf.y && nf.y != nf.z && nf.x != nf.z)
+            newF.push_back(nf);
+    }
+    faces.swap(newF);
+
+    // 重新计算谱信息（简化版本 - 仅在大量简化后重新计算）
+    static int contract_count = 0;
+    if (++contract_count % 100 == 0)
+    {
+        compute_vertex_areas();
+        build_laplacian_matrix();
+        compute_eigenvectors();
+        compute_vertex_importance();
+    }
+
+    update_edges(v1);
     return true;
 }
 
-// Cleanup unused vertices
+// 清理未使用顶点
 void cleanup()
 {
     id_map.clear();
-    if (vertices.empty())
+    int nV = vertices.size();
+    vector<bool> used(nV, false);
+    for (auto &f : faces)
     {
-        s_mesh_structures_valid = true; // Empty but valid
-        s_priority_queue_valid = false; // No edges
-        return;
+        used[f.x] = used[f.y] = used[f.z] = true;
     }
 
-    int nV_old = vertices.size();
-    vector<bool> used(nV_old, false);
-    int max_idx_in_faces = 0;
-    for (const auto &f : faces)
+    vector<vec3> newV;
+    vector<float> newImp;
+    newV.reserve(nV);
+    newImp.reserve(nV);
+    vector<int> remap(nV, -1);
+
+    for (int i = 0; i < nV; ++i)
     {
-        if (f.x < 0 || f.y < 0 || f.z < 0)
-            continue; // Should not happen with valid faces
-        max_idx_in_faces = std::max({max_idx_in_faces, f.x, f.y, f.z});
-        if (f.x < nV_old)
-            used[f.x] = true;
-        if (f.y < nV_old)
-            used[f.y] = true;
-        if (f.z < nV_old)
-            used[f.z] = true;
-    }
-
-    vector<vec3> new_vertices_list;
-    vector<int> remap(max_idx_in_faces + 1, -1); // Ensure remap is large enough
-                                                 // Or remap based on nV_old if safer
-    if (nV_old > max_idx_in_faces + 1)
-        remap.resize(nV_old, -1);
-
-    int current_new_idx = 0;
-    for (int i = 0; i < nV_old; ++i)
-    { // Iterate old vertex indices
         if (used[i])
         {
-            if (i < remap.size())
-            {
-                remap[i] = current_new_idx;
-                id_map[i] = current_new_idx;
-            }
-            else
-            { /* Error: remap array too small, vertex index out of expected bounds */
-            }
-            new_vertices_list.push_back(vertices[i]);
-            current_new_idx++;
+            remap[i] = newV.size();
+            id_map[i] = newV.size();
+            newV.push_back(vertices[i]);
+            newImp.push_back(vertex_importance[i]);
         }
     }
 
     for (auto &f : faces)
     {
-        if (f.x < remap.size())
-            f.x = remap[f.x];
-        else
-            f.x = -1; // Mark invalid if out of bound
-        if (f.y < remap.size())
-            f.y = remap[f.y];
-        else
-            f.y = -1;
-        if (f.z < remap.size())
-            f.z = remap[f.z];
-        else
-            f.z = -1;
-        if (f.x == -1 || f.y == -1 || f.z == -1)
-        {
-            // This face is now invalid, should be removed.
-            // For simplicity, let's assume this leads to degenerate check later or filter here.
-        }
+        f.x = remap[f.x];
+        f.y = remap[f.y];
+        f.z = remap[f.z];
     }
-    // Filter out faces that became invalid due to remapping issues
-    faces.erase(std::remove_if(faces.begin(), faces.end(), [](const ivec3 &f)
-                               { return f.x == -1 || f.y == -1 || f.z == -1 || f.x == f.y || f.y == f.z || f.x == f.z; }),
-                faces.end());
 
-    vertices.swap(new_vertices_list);
-
-    // After cleanup, all adjacencies and PQ are invalid because indices changed.
-    s_mesh_structures_valid = false; // Needs rebuild_adjacency_and_face_indices
-    s_priority_queue_valid = false;  // Needs init_edges
+    vertices.swap(newV);
+    vertex_importance.swap(newImp);
 }
 
-// Main simplification function
-void simplify(float targetRatio)
+// 主谱简化函数
+void simplify_spectral(float targetRatio)
 {
-    if (!s_mesh_structures_valid)
-    { // If SetMesh wasn't called or structures invalidated
-        build_adjacency_and_face_indices();
-    }
-    if (!s_priority_queue_valid)
-    { // If PQ is not reflecting current mesh (e.g. after cleanup)
-        init_edges();
-    }
+    compute_vertex_areas();
+    build_laplacian_matrix();
+    compute_eigenvectors();
+    compute_vertex_importance();
+    build_adjacency();
+    init_edges();
 
-    int initial_faces = faces.size();
-    if (initial_faces == 0)
-        return;
-    int target_num_faces = int(initial_faces * (1.0f - targetRatio));
-    if (target_num_faces < 0)
-        target_num_faces = 0;
-
-    int contractions = 0;
-    const int max_contractions = initial_faces;
-
-    while (faces.size() > target_num_faces && !edge_queue.empty() && contractions < max_contractions)
+    int targetFaces = int(faces.size() * (1.0f - targetRatio));
+    while (faces.size() > targetFaces && !edge_queue.empty())
     {
         Edge e = edge_queue.top();
         edge_queue.pop();
-
         int64_t k = edge_key(e.v1, e.v2);
-        auto it = edge_map.find(k);
-
-        if (it == edge_map.end() || fabs(it->second.cost - e.cost) > 1e-9)
-        {
-            continue; // Stale edge from PQ
-        }
-        // Additional check: ensure vertices and edge still valid in current (possibly modified) graph
-        if (e.v1 >= vertices.size() || e.v2 >= vertices.size() ||
-            e.v1 < 0 || e.v2 < 0 ||
-            e.v1 >= vertex_neighbors.size() || e.v2 >= vertex_neighbors.size() || // vertex_neighbors might shrink
-            !vertex_neighbors[e.v1].count(e.v2))
-        {
-            edge_map.erase(it);
+        if (!edge_map.count(k) || fabs(edge_map[k].cost - e.cost) > 1e-9)
             continue;
-        }
-
         if (contract_edge(e))
-        {
             edge_map.erase(k);
-            contractions++;
-        }
-        else
-        {
-            edge_map.erase(it); // Contraction failed, remove from map
-        }
     }
-    cleanup(); // Final cleanup
-    // After cleanup, structures need rebuild if GetMesh is called or another simplify op.
-    // Let GetMesh handles ensure structures are fine, or user calls SetMesh again.
-    // For now, `simplify` leaves `s_mesh_structures_valid` potentially false (due to cleanup).
+    cleanup();
 }
 
-// Single step simplification
-void simplifyStep()
+void simplify_step_spectral()
 {
-    if (!s_mesh_structures_valid)
-    {
-        build_adjacency_and_face_indices();
-    }
-    if (!s_priority_queue_valid)
-    {
-        init_edges();
-    }
+    compute_vertex_areas();
+    build_laplacian_matrix();
+    compute_eigenvectors();
+    compute_vertex_importance();
+    build_adjacency();
+    init_edges();
 
-    if (edge_queue.empty())
-        return;
-
-    Edge e = {-1, -1, 0, vec3(0)};
-    bool found_valid_edge = false;
-
-    // Pop until a valid edge is found or queue is empty
-    while (!edge_queue.empty())
+    if (!edge_queue.empty())
     {
-        e = edge_queue.top();
+        Edge e = edge_queue.top();
         edge_queue.pop();
         int64_t k = edge_key(e.v1, e.v2);
-        auto it = edge_map.find(k);
-
-        if (it == edge_map.end() || fabs(it->second.cost - e.cost) > 1e-9)
-        {
-            continue; // Stale
-        }
-        if (e.v1 >= vertices.size() || e.v2 >= vertices.size() ||
-            e.v1 < 0 || e.v2 < 0 ||
-            e.v1 >= vertex_neighbors.size() || e.v2 >= vertex_neighbors.size() ||
-            !vertex_neighbors[e.v1].count(e.v2))
-        {
-            edge_map.erase(it);
-            continue; // Invalid
-        }
-        found_valid_edge = true;
-        best_edge = e; // Store original indices for GetActiveVertices
+        if (!edge_map.count(k) || fabs(edge_map[k].cost - e.cost) > 1e-9)
+            return;
         if (contract_edge(e))
         {
             edge_map.erase(k);
+            best_edge = e;
         }
-        else
-        {
-            edge_map.erase(it); // Contraction failed for some reason
-        }
-        break;
     }
-
-    cleanup(); // Cleanup after the step
-    // s_mesh_structures_valid and s_priority_queue_valid will be false now.
+    cleanup();
 }
 
-// --- C Interface ---
+// 设置谱简化参数
+void set_spectral_params(int num_eigen, float spec_weight, float geom_weight)
+{
+    num_eigenvectors = num_eigen;
+    spectral_weight = spec_weight;
+    geometric_weight = geom_weight;
+}
+
+// 接口定义
 extern "C"
 {
     int SetMesh(vec3 *inV, ivec3 *inF, int nV, int nF)
     {
         vertices.assign(inV, inV + nV);
         faces.assign(inF, inF + nF);
-
-        edge_map.clear();
-        while (!edge_queue.empty())
-            edge_queue.pop();
-        vertex_neighbors.clear();
-        vertex_face_indices.clear();
-        best_edge = Edge{-1, -1, 0.0, vec3(0.0f)};
-
-        s_mesh_structures_valid = false; // Force rebuild on first operation
-        s_priority_queue_valid = false;
         return 0;
     }
 
     vec3 *GetMeshVertices(int *outV)
     {
-        if (!s_mesh_structures_valid)
-        { // If cleanup was last op, adjacencies need rebuild for consistency
-            build_adjacency_and_face_indices();
-        }
         *outV = vertices.size();
-        static vector<vec3> buf_v;
-        buf_v = vertices;
-        return buf_v.data();
-    }
-
-    ivec3 *GetMeshFaces(int *outF)
-    {
-        if (!s_mesh_structures_valid)
-        {
-            build_adjacency_and_face_indices();
-        }
-        *outF = faces.size();
-        static vector<ivec3> buf_f;
-        buf_f = faces;
-        return buf_f.data();
+        static vector<vec3> buf;
+        buf = vertices;
+        return buf.data();
     }
 
     void Simplify(float targetRatio)
     {
-        simplify(targetRatio);
+        simplify_spectral(targetRatio);
     }
 
     void SimplifyStep()
     {
-        simplifyStep();
+        simplify_step_spectral();
+    }
+
+    void SetSpectralParams(int numEigenvectors, float spectralWeight, float geometricWeight)
+    {
+        set_spectral_params(numEigenvectors, spectralWeight, geometricWeight);
+    }
+
+    float *GetVertexImportance(int *outSize)
+    {
+        *outSize = vertex_importance.size();
+        static vector<float> buf;
+        buf = vertex_importance;
+        return buf.data();
     }
 
     int *GetActiveVertices()
@@ -638,6 +510,14 @@ extern "C"
         buf.push_back(id_map[best_edge.v1]);
         return buf.data();
     }
+
+    ivec3 *GetMeshFaces(int *outF)
+    {
+        *outF = faces.size();
+        static vector<ivec3> buf;
+        buf = faces;
+        return buf.data();
+    }
 }
 
-#endif // MESH_SIMPLIFICATION_CPP
+#endif // SPECTRAL_SIMPLIFICATION_CPP
