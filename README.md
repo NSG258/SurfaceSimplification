@@ -5,8 +5,8 @@
 - 前端可视化为`visualization.py`
 - 后端代码均位于 `lib` 目录下。
 - 前后端接口分别在 `interface.py` 和 `main.cpp` 中实现。
-- 依赖库 `glm`（G-Lib Math）需要从以下仓库[https://github.com/g-truc/glm.git]下载
-- 依赖库 `eigen` 需要从以下仓库[https://github.com/PX4/eigen.git]下载
+- 依赖库 `glm`（G-Lib Math）需要从以下[仓库](https://github.com/g-truc/glm.git)下载
+- 依赖库 `eigen` 需要从以下[仓库](https://github.com/PX4/eigen.git)下载
 
 下载后将其放置于 `lib` 目录下。
 
@@ -33,7 +33,7 @@ python 依赖
     python visualization.py
 
 
-- 操作过程可见于 `video.mkv`
+- 操作过程可见于 [视频](https://cloud.tsinghua.edu.cn/f/828e5ce1eb1c4fdd8cfa/)
 - 一些测试样例存在 `/obj` 文件夹下，在搜索框中输入其名称即可进行化简，不需要带文件后缀
 - 需要查看单步简化，首先点击重置按钮，并点击单步简化按钮，之后可查看单步简化
 - 若想要使用自己寻找的网格，则可以用fix.py进行水密化处理，否则就会见到非水密网格所取得的抽象结果
