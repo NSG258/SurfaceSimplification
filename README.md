@@ -26,7 +26,7 @@ python 依赖
 
 ## 运行方法
 
-![可视化界面](display_images/ui.png "可视化界面")
+![可视化界面](display_resources/ui.png "可视化界面")
 
 安装好python依赖后，在命令行中输入：
 
@@ -42,7 +42,7 @@ python 依赖
 
 本次实验共在Objaverse数据集上选取了550个物体进行了量化实验，下图是部分可视化的结果，实验物体包括斯坦福公开3D模型和Objaverse中的数据
 
-![结果展示](display_images/result_00.png "结果展示")
+![结果展示](display_resources/result_00.png "结果展示")
 
 量化结果展示如下
 
