@@ -16,10 +16,9 @@ main.py
 *.so
 *.dll
 
+video.mkv
 venv/
 env/
-results/
-objs/
 
 .DS_Store
 

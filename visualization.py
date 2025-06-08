@@ -44,7 +44,7 @@ def set_face_colors(polydata, face_indices, color):
     polydata.GetCellData().SetScalars(colors)
 
 class VTKWindow(QtWidgets.QMainWindow):
-    def __init__(self, parent=None):
+    def __init__(self, lib_suffix, parent=None):
         super().__init__(parent)
 
         self.origin_mesh_path = None
@@ -55,6 +55,7 @@ class VTKWindow(QtWidgets.QMainWindow):
         self.uid = None
         self.method = "QEM"
         self.simplify_ratio = 0.5
+        self.lib_suffix = lib_suffix
 
         self.frame = QtWidgets.QFrame()
         self.layout = QtWidgets.QVBoxLayout()
@@ -367,22 +368,22 @@ class VTKWindow(QtWidgets.QMainWindow):
         self.structure_aware_button.setStyleSheet(self.other_method_style_sheet)
 
         if self.method == "QEM":
-            init_processor("main.dll")
+            init_processor(f"main{self.lib_suffix}")
             self.qem_button.setStyleSheet(self.method_style_sheet)
             self.method_label.setText("当前方法: 经典QEM")
             self.method_label.repaint()
         elif self.method == "LindstromTurk":
-            init_processor("lindstrom_turk.dll")
+            init_processor(f"lindstrom_turk{self.lib_suffix}")
             self.lt_button.setStyleSheet(self.method_style_sheet)
             self.method_label.setText("当前方法: Lindstrom Turk")
             self.method_label.repaint()
         elif self.method == "Spectral":
-            init_processor("spectral.dll")
+            init_processor(f"spectral{self.lib_suffix}")
             self.spectral_button.setStyleSheet(self.method_style_sheet)
             self.method_label.setText("当前方法: Spectral")
             self.method_label.repaint()
         else:
-            init_processor("structure_aware.dll")
+            init_processor(f"structure_aware{self.lib_suffix}")
             self.structure_aware_button.setStyleSheet(self.method_style_sheet)
             self.method_label.setText("当前方法: Structure Aware")
             self.method_label.repaint()
@@ -468,7 +469,7 @@ class VTKWindow(QtWidgets.QMainWindow):
         mesh = trimesh.load(self.origin_mesh_path, process=False)
         
         V = mesh.vertices.astype(np.float32)
-        if uid == "gun":
+        if uid == "gun" or uid == "sword":
             V = V @ np.array([[0, 0, 1.0],
                               [0, 1.0, 0],
                               [1.0, 0, 0]], dtype=V.dtype)
@@ -722,5 +723,6 @@ class VTKWindow(QtWidgets.QMainWindow):
 if __name__ == "__main__":
 
     app = QtWidgets.QApplication(sys.argv)
-    window = VTKWindow()
+    lib_suffix = ".dll"
+    window = VTKWindow(lib_suffix=lib_suffix)
     sys.exit(app.exec_())

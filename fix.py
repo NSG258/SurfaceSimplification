@@ -1,7 +1,6 @@
 import os
 import numpy as np
 
-# 第一步：加载原始非流形 obj 文件
 input_path = os.path.join("non_manifold", "crate.obj")
 output_path = os.path.join("objs", "crate.obj")
 
@@ -50,6 +49,5 @@ with open(output_path, 'w') as f:
     for face in new_faces:
         f.write('f ' + ' '.join(map(str, face)) + '\n')
 
-print(f'✅ 顶点合并完成，输出文件: {output_path}')
 print(f'原始顶点数: {len(vertices)}, 合并后: {len(new_vertices)}')
 print(f'原始面数: {len(faces)}, 合并后: {len(new_faces)}')
