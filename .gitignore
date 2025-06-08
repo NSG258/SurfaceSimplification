@@ -7,6 +7,11 @@ __pycache__/
 *.sqlite3
 *.db
 .env
+.txt
+batch.bat
+fix.py
+gen.py
+main.py
 
 *.so
 *.dll
@@ -14,6 +19,7 @@ __pycache__/
 venv/
 env/
 results/
+objs/
 
 .DS_Store
 

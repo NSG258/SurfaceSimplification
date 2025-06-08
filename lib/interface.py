@@ -3,8 +3,15 @@ import numpy as np
 import os
 
 libpath = os.path.dirname(os.path.abspath(__file__))
-# Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.dll'))
-Processor = cdll.LoadLibrary(os.path.join(libpath, 'structure_aware.so'))
+Processor = cdll.LoadLibrary(os.path.join(libpath, 'main.dll'))
+# Processor = cdll.LoadLibrary(os.path.join(libpath, 'structure_aware.so'))
+
+def init_processor(libname):
+    global Processor
+    from os.path import abspath, dirname, join
+    libpath = dirname(abspath(__file__))
+    full_lib_path = join(libpath, libname)
+    Processor = cdll.LoadLibrary(full_lib_path)
 
 
 
