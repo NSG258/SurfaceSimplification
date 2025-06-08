@@ -23,5 +23,4 @@ env/
 .DS_Store
 
 glm/
-
-*.png
+images/
